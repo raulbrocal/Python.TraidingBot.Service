@@ -1,0 +1,24 @@
+# Entornos virtuales
+venv/
+env/
+ENV/
+
+# Caché de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Configuración sensible e inicios de sesión (¡CRÍTICO!)
+.env
+*.session
+*.session-journal
+
+# Bases de datos locales (si usas SQLite)
+*.sqlite3
+*.db
+
+# Archivos del sistema u otros
+.DS_Store
+Thumbs.db
