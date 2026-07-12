@@ -10,7 +10,11 @@ class MT5Executor:
         self.account = int(account)
         self.password = password
         self.server = server
-        self.magic_number = 123456
+        
+        # Identificadores únicos (Magic Numbers) para separar las estrategias
+        self.magic_number = 123456         # PrimeGold
+        self.logan_magic_number = 202611   # LoganGold
+        
         # Riesgo del 0.5% para FTMO
         self.risk_percent = float(os.getenv("RISK_PERCENT_PER_SIGNAL", 0.5))
         self.max_lot_per_order = 0.5 
@@ -32,6 +36,9 @@ class MT5Executor:
         lot = min(lot, self.max_lot_per_order)
         return max(lot, si.volume_min)
 
+    # =====================================================================
+    # LÓGICA EXISTENTE: SERVICIO PRIME GOLD
+    # =====================================================================
     def execute(self, signal):
         acc = mt5.account_info()
         if not acc: return False
@@ -61,7 +68,7 @@ class MT5Executor:
 
         for entry_p in entries:
             for tp_p in tps:
-                # Calculamos el lote basado en el precio planificado (como solicitaste, mismo peso)
+                # Calculamos el lote basado en el precio planificado (mismo peso)
                 lot = self._calculate_lot(signal.symbol, entry_p, signal.stop_loss, risk_per_order)
                 
                 # Por defecto, configuramos la orden como PENDIENTE (Limit)
@@ -106,10 +113,9 @@ class MT5Executor:
                     tipo_fallo = "Mercado" if is_market else "Límite"
                     logger.error(f"❌ Error Orden {tipo_fallo} en {exec_price}: {res.comment}")
                 else:
-                    # Mensaje opcional para ver en consola qué hizo el bot
                     if is_market:
                         logger.info(f"⚡ Rescate exitoso: Orden Market ejecutada a {exec_price}")
-                    
+                        
         return True
 
     def set_trades_to_breakeven(self):
@@ -118,7 +124,6 @@ class MT5Executor:
         
         if not positions:
             logger.info("ℹ️ No hay posiciones abiertas, procediendo a limpiar órdenes pendientes huérfanas.")
-            # USAMOS TU FUNCIÓN AQUÍ: Si mandan BE pero ya se había cerrado por TP/SL, limpiamos la matriz restante
             self.cancel_pending_orders()
             return True
 
@@ -166,10 +171,8 @@ class MT5Executor:
                 mt5.order_send(request_sl)
 
         # --- PUNTO B: LIMPIEZA DE ÓRDENES PENDIENTES ---
-        # USAMOS TU FUNCIÓN AQUÍ: Una vez protegidas las operaciones vivas, borramos el resto de la matriz
         logger.info("🧹 Ejecutando limpieza de órdenes pendientes restantes...")
         self.cancel_pending_orders()
-
         return True
 
     def cancel_pending_orders(self):
@@ -184,7 +187,6 @@ class MT5Executor:
         acc = mt5.account_info()
         if not acc: return False
         
-        # Obtener el precio actual (Ask para BUY, Bid para SELL)
         symbol = signal.symbol
         mt5.symbol_select(symbol, True)
         tick = mt5.symbol_info_tick(symbol)
@@ -203,11 +205,10 @@ class MT5Executor:
         logger.info(f"⚡ EJECUCIÓN MARKET (ACTIVA) en {symbol} a {current_price}")
 
         for tp_p in tps:
-            # Calculamos el lote basado en la distancia del precio actual al SL
             lot = self._calculate_lot(symbol, current_price, signal.stop_loss, risk_per_order)
             
             request = {
-                "action": mt5.TRADE_ACTION_DEAL, # DEAL = Entrada inmediata
+                "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
                 "volume": lot,
                 "type": mt5.ORDER_TYPE_BUY if signal.action == TradeAction.BUY else mt5.ORDER_TYPE_SELL,
@@ -224,3 +225,132 @@ class MT5Executor:
                 logger.error(f"❌ Error Market Order: {res.comment}")
         
         return True
+
+    # =====================================================================
+    # LÓGICA NUEVA: SERVICIO LOGAN GOLD
+    # =====================================================================
+    def execute_logan_market_order(self, action, symbol="XAUUSD"):
+        """Abre una posición instantánea a mercado para LoganGold sin SL/TP (Lote proporcional seguro)"""
+        acc = mt5.account_info()
+        if not acc:
+            logger.error("❌ No se pudo obtener la información de la cuenta para LoganGold.")
+            return None, None, None
+
+        # Al no haber SL inicial en el mensaje "YA", aplicamos un cálculo proporcional estricto.
+        # Un multiplicador de 0.0000025 abre exactamente 0.50 lotes en una cuenta de $200k.
+        # De esta forma el bot se autoajusta de forma idéntica respetando el cap máximo de FTMO.
+        calculated_lot = round(acc.balance * 0.0000025, 2)
+        lot = min(calculated_lot, self.max_lot_per_order)
+        
+        si = mt5.symbol_info(symbol)
+        if si:
+            lot = max(lot, si.volume_min)
+        else:
+            lot = max(lot, 0.01)
+
+        mt5.symbol_select(symbol, True)
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            logger.error(f"❌ Imposible obtener cotización en vivo de {symbol} para LoganGold.")
+            return None, None, None
+
+        order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+        price = tick.ask if action == "BUY" else tick.bid
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
+            "deviation": 20,
+            "magic": self.logan_magic_number,
+            "comment": "LoganGold Immediate",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        logger.info(f"[MT5] Lanzando orden instantánea LoganGold: {action} {lot} lotes a {price}")
+        res = mt5.order_send(request)
+        
+        if res.retcode == mt5.TRADE_RETCODE_DONE:
+            return res.order, res.price, res.volume
+        else:
+            logger.error(f"❌ Error al abrir orden LoganGold: {res.comment} (Retcode: {res.retcode})")
+            return None, None, None
+
+    def modify_position_sl(self, ticket, sl_price):
+        """Modifica quirúrgicamente el Stop Loss de una posición viva usando su ticket"""
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            logger.error(f"❌ No se localizó la posición #{ticket} para actualizar el SL.")
+            return False
+        
+        pos = positions[0]
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": pos.symbol,
+            "sl": float(sl_price),
+            "tp": pos.tp  # Respeta y mantiene el Take Profit que tenga la orden actual
+        }
+        
+        res = mt5.order_send(request)
+        if res.retcode == mt5.TRADE_RETCODE_DONE:
+            return True
+        else:
+            logger.error(f"❌ Error al modificar SL del Ticket #{ticket}: {res.comment}")
+            return False
+
+    def partial_close_position(self, ticket, volume_to_close):
+        """Ejecuta un cierre parcial abriendo un lote inverso enlazado al ticket original"""
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            logger.error(f"❌ No se encontró la posición con Ticket #{ticket} para realizar el parcial.")
+            return False
+        
+        pos = positions[0]
+        symbol = pos.symbol
+        
+        # Seguridad: Controlar que no se intente cerrar más volumen del que queda vivo
+        volume_to_close = min(float(volume_to_close), pos.volume)
+        volume_to_close = round(volume_to_close, 2)
+        if volume_to_close <= 0:
+            return False
+
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            return False
+
+        # Inversión de orden para deducción de volumen parcial
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume_to_close,
+            "type": close_type,
+            "position": ticket,  # Parámetro clave en MT5 para procesar reducciones parciales
+            "price": price,
+            "deviation": 20,
+            "magic": self.logan_magic_number,
+            "comment": "Logan Partial Close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        res = mt5.order_send(request)
+        if res.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"✅ Reducción parcial completada: {volume_to_close} lotes cerrados en Ticket #{ticket}")
+            return True
+        else:
+            logger.error(f"❌ Falló la ejecución del parcial en Ticket #{ticket}: {res.comment}")
+            return False
+
+    def close_position_completely(self, ticket):
+        """Cierra el 100% de los lotes remanentes de una posición activa"""
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            return False
+        return self.partial_close_position(ticket, positions[0].volume)
