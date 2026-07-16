@@ -1,48 +1,54 @@
 import re
+from abc import ABC, abstractmethod
 from models import TradeSignal, TradeAction
 
-class SignalMapper:
+class BaseMapper(ABC):
+    @abstractmethod
+    def map_message(self, message: str) -> TradeSignal | None:
+        """Contrato obligatorio para parsear mensajes de canales específicos."""
+        pass
+
+
+class PrimeGoldMapper(BaseMapper):
     def map_message(self, message: str) -> TradeSignal | None:
         if not message:
             return None
 
-        msg_lower = message.lower()
+        msg_lower = message.lower().strip()
         
-        # 1. Detección de entrada a mercado inmediata
-        if msg_lower.strip() == "activa" or msg_lower.startswith("activa"):
-            return TradeSignal(action=TradeAction.ACTIVATE, symbol="", entry_min=0, entry_max=0, stop_loss=0, take_profits=[])
+        # 1. Entrada de pánico (Activa)
+        if msg_lower == "activa" or msg_lower.startswith("activa"):
+            return TradeSignal(action=TradeAction.ACTIVATE, symbol="XAUUSD")
         
-        # 2. Detección de Breakeven
-        be_keywords = ["breakeven", "SL al precio de entrada", "modicamos el sl", "asegurar"]
-        if any(keyword in msg_lower for keyword in be_keywords):
-            return TradeSignal(action=TradeAction.BREAKEVEN, symbol="", entry_min=0, entry_max=0, stop_loss=0, take_profits=[])
-
-        # 3. Detección de Cancelación
+        # 2. Cancelación
         cancel_keywords = ["se fue", "anulamos", "buscamos otra"]
-        if any(keyword in msg_lower for keyword in cancel_keywords):
-            return TradeSignal(action=TradeAction.CANCEL, symbol="", entry_min=0, entry_max=0, stop_loss=0, take_profits=[])
+        if any(kw in msg_lower for kw in cancel_keywords):
+            return TradeSignal(action=TradeAction.CANCEL, symbol="XAUUSD")
 
-        # 4. Lógica de mapeo de señal normal (BUY/SELL LIMIT)
+        # 3. Señal estándar (BUY/SELL LIMIT)
         action = None
         if "buy" in msg_lower: action = TradeAction.BUY
         elif "sell" in msg_lower: action = TradeAction.SELL
         
-        if not action: return None
+        if not action: 
+            return None
 
         try:
-            # Extraer Símbolo
             symbol_match = re.search(r'(XAUUSD|GOLD)', msg_lower, re.I)
-            symbol = symbol_match.group(1).upper() if symbol_match else "XAUUSD"
+            symbol = "XAUUSD"  # Por defecto siempre operamos Oro en estos canales
             
-            # Extraer Rango de Entrada (Ej: 4711-4707)
-            entries = re.findall(r'(\d{4}(?:\.\d+)?)', msg_lower)
+            # Extraer rango (ej: 2315 - 2311)
+            entries = re.findall(r'(\d+(?:\.\d+)?)', msg_lower)
+            if len(entries) < 2:
+                return None
             e1, e2 = float(entries[0]), float(entries[1])
             
-            # Extraer Stop Loss
-            sl = float(re.search(r'SL\s*(\d+(?:\.\d+)?)', msg_lower, re.I).group(1))
+            # Stop Loss
+            sl_match = re.search(r'sl\s*[:\s]*(\d+(?:\.\d+)?)', msg_lower, re.I)
+            sl = float(sl_match.group(1)) if sl_match else 0.0
             
-            # Extraer Take Profits
-            tps = [float(tp) for tp in re.findall(r'TP\s*(\d+(?:\.\d+)?)', msg_lower, re.I)]
+            # Take Profits
+            tps = [float(tp) for tp in re.findall(r'tp\s*[:\s]*(\d+(?:\.\d+)?)', msg_lower, re.I)]
             
             return TradeSignal(
                 action=action,
@@ -50,7 +56,67 @@ class SignalMapper:
                 entry_min=min(e1, e2),
                 entry_max=max(e1, e2),
                 stop_loss=sl,
-                take_profits=tps
+                take_profits=tps,
+                raw_message=message
             )
-        except Exception as e:
+        except Exception:
+            return None
+
+
+class LoganGoldMapper(BaseMapper):
+    def map_message(self, message: str) -> TradeSignal | None:
+        if not message:
+            return None
+
+        msg_lower = message.lower().strip()
+
+        # 1. Gatillo de Entrada Inmediata a Mercado ("GOLD SELL YA", "GOLD BUY YA")
+        if "ya" in msg_lower and not "be" in msg_lower:
+            if "buy" in msg_lower:
+                return TradeSignal(action=TradeAction.BUY, symbol="XAUUSD", raw_message=message)
+            elif "sell" in msg_lower:
+                return TradeSignal(action=TradeAction.SELL, symbol="XAUUSD", raw_message=message)
+
+        # 2. Gestión de Breakeven ("BE", "MUEVAN SL A BE YA")
+        be_keywords = ["be", "muevan sl a be", "sl a be"]
+        if any(keyword == msg_lower or keyword in msg_lower for keyword in be_keywords):
+            return TradeSignal(action=TradeAction.BREAKEVEN, symbol="XAUUSD", raw_message=message)
+
+        # 3. Procesar Señal Estándar de Logan (con su rango y SL)
+        action = None
+        if "buy" in msg_lower: action = TradeAction.BUY
+        elif "sell" in msg_lower: action = TradeAction.SELL
+
+        if not action:
+            return None
+
+        try:
+            symbol = "XAUUSD"
+
+            # Buscar rango con guion (ej: 4030 - 4034)
+            range_match = re.search(r'(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)', msg_lower)
+            if range_match:
+                e1, e2 = float(range_match.group(1)), float(range_match.group(2))
+                entry_min = min(e1, e2)
+                entry_max = max(e1, e2)
+            else:
+                entry_min = entry_max = 0.0
+
+            # Stop Loss (SL: 4038)
+            sl_match = re.search(r'sl\s*[:\s]*(\d+(?:\.\d+)?)', msg_lower, re.I)
+            sl = float(sl_match.group(1)) if sl_match else 0.0
+
+            # Take Profits (Ignoramos strings como "ABIERTO" buscando solo los numéricos)
+            tps = [float(tp) for tp in re.findall(r'tp\s*[:\s]*(\d+(?:\.\d+)?)', msg_lower, re.I)]
+
+            return TradeSignal(
+                action=action,
+                symbol=symbol,
+                entry_min=entry_min,
+                entry_max=entry_max,
+                stop_loss=sl,
+                take_profits=tps,
+                raw_message=message
+            )
+        except Exception:
             return None

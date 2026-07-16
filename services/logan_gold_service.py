@@ -1,158 +1,187 @@
 import logging
-import asyncio
-import re
-from datetime import datetime
+import time
 import MetaTrader5 as mt5
+from models import TradeSignal, TradeAction
+from services.base_service import BaseService
 
 logger = logging.getLogger(__name__)
 
-class LoganGoldService:
-    def __init__(self, channel_id, executor):
-        self.channel_id = channel_id
-        self.executor = executor
+class LoganGoldService(BaseService):
+    def __init__(self, channel_id: int, mapper, executor):
+        super().__init__(channel_id, executor)
+        self.mapper = mapper
         
-        # Estado de gatillo controlado por marca de tiempo (Anti condiciones de carrera)
-        self.last_ready_time = None  
+        # Magic number y configuraciones exclusivas de Logan
+        self.magic_number = 202611
+        self.max_lot_per_order = 0.50 
         
-        # Tracking preciso de la posición activa de Logan
-        self.active_ticket = None
-        self.entry_price = None
-        self.direction = None  # "BUY" o "SELL"
-        self.volume = 0.0
+        # Guardamos el último ticket para poder aplicarle cierres parciales
+        self.last_ticket = None
+
+    async def process_message(self, message: str):
+        self.logger.info("📩 Procesando mensaje de Logan Gold...")
+        msg_lower = message.lower().strip()
         
-        # Tarea de monitoreo en segundo plano
-        self.monitor_task = None
-
-    async def process_message(self, text: str):
-        text_lower = text.lower().strip()
-        logger.info(f"[LoganGold] 📩 Procesando mensaje del canal...")
-
-        # 1. DETECCIÓN DEL "READY"
-        if "ready" in text_lower:
-            self.last_ready_time = datetime.now()
-            logger.info("[LoganGold] 🔔 Mensaje 'Ready' registrado con marca de tiempo actual.")
-            return
-
-        # 2. DETECCIÓN DEL GATILLO "YA"
-        if "sell ya" in text_lower or "buy ya" in text_lower:
-            now = datetime.now()
-            # Margen máximo de 5 minutos (300 segundos) para validar el Ready previo
-            if self.last_ready_time and (now - self.last_ready_time).total_seconds() < 300:
-                logger.info("🚀 ¡GATILLO VALIDADO POR TIEMPO! Ejecutando a mercado de inmediato...")
-                self.last_ready_time = None  # Consumimos el Ready para evitar dobles entradas
-                
-                action = "SELL" if "sell ya" in text_lower else "BUY"
-                
-                # Lanzar orden en MT5 (con la corrección anti-0.0 implementada en executor.py)
-                ticket, price, volume = self.executor.execute_logan_market_order(action)
-                
-                if ticket and price and price > 0:
-                    self.active_ticket = ticket
-                    self.entry_price = float(price)
-                    self.direction = action
-                    self.volume = float(volume)
-                    
-                    logger.info(f"[LoganGold] ✅ Posición abierta con Ticket #{ticket} a precio {price} (Lotes: {volume})")
-                    
-                    # Cancelamos monitoreo previo si existía (por seguridad)
-                    if self.monitor_task and not self.monitor_task.done():
-                        self.monitor_task.cancel()
-                        
-                    # Iniciamos el bucle de monitoreo en vivo de esta posición
-                    self.monitor_task = asyncio.create_task(self._monitor_position(ticket))
-                else:
-                    logger.error("[LoganGold] ❌ El ejecutor no pudo abrir la posición o devolvió valores inválidos.")
+        # 1. FILTROS DE GESTIÓN DE TP Y CIERRES ESPECÍFICOS DE LOGAN
+        
+        # --- TP 2: Asegurar el 80% de la posición inicial ---
+        if msg_lower.startswith("tp 2"):
+            if self.last_ticket:
+                self.logger.info("✂️ TP 2 alcanzado. Cerrando el 80% del volumen inicial...")
+                self._execute_partial_close(self.last_ticket, percentage=0.80)
             else:
-                logger.warning("[LoganGold] ⚠️ Gatillo 'YA' ignorado: No hubo un 'Ready' reciente o pasaron más de 5 minutos.")
+                self.logger.warning("⚠️ TP 2 solicitado, pero no hay ticket activo en memoria.")
             return
 
-        # 3. ACTUALIZACIÓN DE SL/TP INICIAL (Ej: SL: 4081)
-        sl_match = re.search(r"sl:\s*(\d+(?:\.\d+)?)", text_lower)
-        if sl_match:
-            sl_val = float(sl_match.group(1))
-            if self.active_ticket:
-                logger.info(f"[LoganGold] 🎯 Nivel de SL detectado: {sl_val}. Aplicando al Ticket #{self.active_ticket}...")
-                success = self.executor.modify_position_sl(self.active_ticket, sl_val)
-                if success:
-                    logger.info(f"[LoganGold] ✅ SL modificado con éxito a {sl_val}")
-                else:
-                    logger.error(f"[LoganGold] ❌ No se pudo modificar el SL en MT5.")
+        # --- TP 3: Asegurar otro 10% de la posición inicial ---
+        if msg_lower.startswith("tp 3"):
+            if self.last_ticket:
+                self.logger.info("✂️ TP 3 alcanzado. Cerrando la mitad del volumen restante (10% del total)...")
+                # Pasamos 0.50 porque queremos la mitad del 20% que quedaba vivo
+                self._execute_partial_close(self.last_ticket, percentage=0.50)
             else:
-                logger.warning("[LoganGold] ⚠️ Se recibieron niveles de SL/TP pero no hay ninguna posición activa en el bot.")
+                self.logger.warning("⚠️ TP 3 solicitado, pero no hay ticket activo en memoria.")
             return
-
-        # 4. MODIFICACIONES DE SL EN VIVO (Mover a BE o nuevos niveles de SL)
-        # Caso A: Breakeven (Ej: "recordad el SL en BE" o "aseguren ganancias")
-        if "sl en be" in text_lower or "sl a be" in text_lower or "aseguren" in text_lower:
-            if self.active_ticket and self.entry_price:
-                # Aplicamos un pequeño colchón de spread (0.2 USD en Oro = 2 pips) para cubrir comisiones
-                offset = 0.20 if self.direction == "BUY" else -0.20
-                be_price = round(self.entry_price + offset, 2)
-                
-                logger.info(f"[LoganGold] 🛡️ Ajustando SL de Ticket #{self.active_ticket} a Breakeven ({be_price})...")
-                self.executor.modify_position_sl(self.active_ticket, be_price)
-            return
-
-        # Caso B: Mover SL a nivel específico (Ej: "MOVEMOS SL A 4070" o "SL A 4070")
-        move_sl_match = re.search(r"(?:movemos|move|sl)\s+sl\s+(?:a|to)\s*(\d+(?:\.\d+)?)", text_lower) or \
-                        re.search(r"sl\s+(?:a|to)\s*(\d+(?:\.\d+)?)", text_lower)
-        if move_sl_match:
-            target_sl = float(move_sl_match.group(1))
-            if self.active_ticket:
-                logger.info(f"[LoganGold] 🔄 Ajustando SL dinámicamente a {target_sl} para Ticket #{self.active_ticket}...")
-                self.executor.modify_position_sl(self.active_ticket, target_sl)
-            return
-
-        # 5. CIERRES TOTALES O ABANDONO (Ej: "estoy fuera", "cerrar todo", "close now")
-        if "estoy fuera" in text_lower or "close" in text_lower or "cerrar" in text_lower:
-            if self.active_ticket:
-                logger.info(f"[LoganGold] 🛑 Solicitud de cierre total detectada. Cerrando Ticket #{self.active_ticket}...")
-                self.executor.close_position_completely(self.active_ticket)
-                self._reset_state()
-            return
-
-    async def _monitor_position(self, ticket):
-        """Bucle asíncrono para verificar que la posición sigue viva y aplicar medidas de seguridad"""
-        logger.info(f"[LoganGold] 🔍 Monitoreo en vivo iniciado para Ticket #{ticket}...")
-        
-        # Pequeña pausa inicial para dejar que MT5 asiente la posición en el servidor
-        await asyncio.sleep(1) 
-        
-        while self.active_ticket == ticket:
-            try:
-                # 1. Verificar si la posición sigue existiendo (por si tocó SL/TP nativo en MT5)
-                positions = mt5.positions_get(ticket=ticket)
-                if not positions:
-                    logger.info(f"[LoganGold] ℹ️ La posición #{ticket} ya se ha cerrado en MT5. Finalizando monitoreo.")
-                    self._reset_state()
-                    break
-
-                pos = positions[0]
-                current_price = pos.price_current
-                entry_price = self.entry_price or pos.price_open
-                
-                # 2. LÍMITE DE SEGURIDAD (ANTI-FALLOS): 100 pips (10.0 USD de distancia en Oro)
-                # Al estar solucionado el bug del precio de entrada (ya no es 0.0), esta regla solo
-                # se activará si el precio sufre una catástrofe de 10 USD en contra (o a favor) sin actualizarse.
-                if entry_price > 0:
-                    price_diff_usd = abs(current_price - entry_price)
-                    if price_diff_usd >= 10.0: 
-                        logger.warning(f"[LoganGold] 🏁 Límite de seguridad de 100 pips alcanzado ({entry_price} -> {current_price}). Cerrando posición.")
-                        self.executor.close_position_completely(ticket)
-                        self._reset_state()
-                        break
-
-            except Exception as e:
-                logger.error(f"[LoganGold] Error en bucle de monitoreo: {e}")
             
-            await asyncio.sleep(1)  # Barrido de control cada segundo
+        # --- Cierre total ---
+        if any(kw in msg_lower for kw in ["todos los tps", "posiciones cerradas"]):
+            if self.last_ticket:
+                self.logger.info("🛑 Comando de cierre total detectado. Cerrando el resto de la posición.")
+                self._execute_complete_close(self.last_ticket)
+            return
+        
+        # 2. MAPEO DE SEÑAL NORMAL
+        signal = self.mapper.map_message(message)
+        if not signal:
+            return
 
-    def _reset_state(self):
-        """Limpia las variables de tracking al terminar la operación actual"""
-        self.active_ticket = None
-        self.entry_price = None
-        self.direction = None
-        self.volume = 0.0
-        if self.monitor_task and not self.monitor_task.done():
-            self.monitor_task.cancel()
-        logger.info("[LoganGold] 🧹 Estado de LoganGold reseteado con éxito. Listo para la siguiente señal.")
+        # 3. ENRUTADOR DE ACCIONES
+        if signal.action in [TradeAction.BUY, TradeAction.SELL]:
+            self._execute_market_order(signal)
+            
+        elif signal.action == TradeAction.BREAKEVEN:
+            self.logger.info("🛡️ Comando de Breakeven en vivo detectado para Logan. Protegiendo posición...")
+            self._set_trades_to_breakeven()
+
+    def _execute_market_order(self, signal: TradeSignal):
+        """Abre una posición instantánea a mercado y verifica el precio de apertura."""
+        balance = self.executor.get_account_balance()
+        if balance <= 0:
+            self.logger.error("❌ No se pudo obtener el balance para LoganGold.")
+            return
+
+        # Lote proporcional específico de Logan (0.50 lotes para cuenta de 200k)
+        calculated_lot = round(balance * 0.0000025, 2)
+        lot = min(calculated_lot, self.max_lot_per_order)
+        
+        symbol = signal.symbol if signal.symbol else "XAUUSD"
+        si = self.executor.get_symbol_info(symbol)
+        lot = max(lot, si.volume_min) if si else max(lot, 0.01)
+
+        tick = self.executor.get_tick(symbol)
+        if not tick:
+            self.logger.error(f"❌ Imposible obtener cotización en vivo de {symbol}.")
+            return
+
+        order_type = mt5.ORDER_TYPE_BUY if signal.action == TradeAction.BUY else mt5.ORDER_TYPE_SELL
+        price = tick.ask if signal.action == TradeAction.BUY else tick.bid
+
+        self.logger.info(f"⚡ Lanzando orden instantánea LoganGold: {signal.action.name} {lot} lotes a {price}")
+
+        # Delegamos el envío puro de la orden al executor genérico
+        res = self.executor.send_order(
+            symbol=symbol,
+            order_type=order_type,
+            volume=lot,
+            price=price,
+            sl=signal.stop_loss,
+            tp=signal.take_profits[0] if signal.take_profits else 0.0,
+            magic=self.magic_number,
+            comment="LoganGold Immediate",
+            is_market=True
+        )
+
+        if res:
+            actual_price = res.price
+            
+            # --- SOLUCIÓN CRÍTICA: ANTI-PRECIO 0.0 ---
+            if actual_price <= 0.0:
+                self.logger.warning("⚠️ Broker retornó precio 0.0. Recuperando desde MT5...")
+                for _ in range(5):
+                    positions = self.executor.get_positions(ticket=res.order)
+                    if positions:
+                        actual_price = positions[0].price_open
+                        self.logger.info(f"🎯 Precio real recuperado de la posición viva: {actual_price}")
+                        break
+                    time.sleep(0.05)
+            
+            # Guardamos el ticket para futuros cierres parciales
+            self.last_ticket = res.order
+            self.logger.info(f"✅ Trade LoganGold vivo. Ticket: #{res.order}")
+        else:
+            self.logger.error("❌ Fallo en la apertura de orden LoganGold.")
+
+    def _execute_partial_close(self, ticket: int, percentage: float = 0.5):
+        """Calcula el volumen correspondiente al porcentaje y solicita el cierre al ejecutor."""
+        positions = self.executor.get_positions(ticket=ticket)
+        if not positions:
+            self.logger.error(f"❌ No se localizó el Ticket #{ticket} para cierre parcial.")
+            return False
+            
+        pos = positions[0]
+        volume_to_close = round(pos.volume * percentage, 2)
+        
+        # Respetar el lote mínimo del broker
+        si = self.executor.get_symbol_info(pos.symbol)
+        min_vol = si.volume_min if si else 0.01
+        if volume_to_close < min_vol:
+            self.logger.warning(f"⚠️ El volumen a cerrar ({volume_to_close}) es menor al mínimo permitido.")
+            return False
+
+        success = self.executor.close_position(ticket, volume_to_close)
+        if success:
+            self.logger.info(f"✂️✅ Reducción del {percentage*100}% completada: {volume_to_close} lotes cerrados.")
+        return success
+
+    def _execute_complete_close(self, ticket: int):
+        """Cierra el 100% de la posición actual."""
+        positions = self.executor.get_positions(ticket=ticket)
+        if not positions:
+            return False
+            
+        success = self.executor.close_position(ticket, positions[0].volume)
+        if success:
+            self.logger.info(f"🛑✅ Posición #{ticket} cerrada por completo.")
+            self.last_ticket = None  # Limpiamos el tracker
+        return success
+    
+    def _set_trades_to_breakeven(self):
+        """Mueve el Stop Loss de las posiciones activas de Logan al precio de entrada más colchón."""
+        positions = self.executor.get_positions(magic_number=self.magic_number)
+        if not positions:
+            self.logger.info("ℹ️ No hay posiciones abiertas de LoganGold para aplicar BE.")
+            return
+
+        for pos in positions:
+            symbol_info = self.executor.get_symbol_info(pos.symbol)
+            if not symbol_info: continue
+
+            point = symbol_info.point
+            digits = symbol_info.digits
+            
+            current_spread_points = symbol_info.spread
+            safety_offset_points = max(current_spread_points + 5, 20) 
+            offset = safety_offset_points * point
+
+            open_price = pos.price_open
+            
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                new_sl = round(open_price + offset, digits)
+                if pos.sl >= new_sl and pos.sl != 0.0: continue
+            else:
+                new_sl = round(open_price - offset, digits)
+                if pos.sl <= new_sl and pos.sl != 0.0: continue
+
+            success = self.executor.modify_position_sl(pos.ticket, new_sl)
+            if success:
+                self.logger.info(f"✅ SL de Logan Ticket #{pos.ticket} blindado en {new_sl}")
