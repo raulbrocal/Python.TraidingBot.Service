@@ -14,63 +14,64 @@ class LoganGoldService(BaseService):
         # Magic number y configuraciones exclusivas de Logan
         self.magic_number = 202611
         self.max_lot_per_order = 0.50 
-        
-        # Guardamos el último ticket para poder aplicarle cierres parciales
-        self.last_ticket = None
 
     async def process_message(self, message: str):
         self.logger.info("📩 Procesando mensaje de Logan Gold...")
         msg_lower = message.lower().strip()
         
         # 1. FILTROS DE GESTIÓN DE TP Y CIERRES ESPECÍFICOS DE LOGAN
-        
-        # --- TP 2: Asegurar el 80% de la posición inicial ---
+
+        # --- TP 1: No hacer nada (Estrategia Logan Gold) ---
+        if "tp 1" in msg_lower:
+            # Si el mensaje exige mover a BE en el mismo texto (ej: "TP 1 MUEVAN SL A BE YA"),
+            # dejamos pasar el flujo para que aplique el Breakeven. Si no, salimos sin operar.
+            if not any(kw in msg_lower for kw in ["be", "sl a be", "muevan", "asegurar"]):
+                self.logger.info("🎯 TP 1 detectado en Telegram. Estrategia: Mantener la posición (Sin acciones en TP1).")
+                return
+
+        # --- TP 2: Asegurar el 80% de todas las posiciones vivas ---
         if msg_lower.startswith("tp 2"):
-            if self.last_ticket:
-                self.logger.info("✂️ TP 2 alcanzado. Cerrando el 80% del volumen inicial...")
-                self._execute_partial_close(self.last_ticket, percentage=0.80)
-            else:
-                self.logger.warning("⚠️ TP 2 solicitado, pero no hay ticket activo en memoria.")
+            self.logger.info("✂️ TP 2 alcanzado. Reduciendo el 80% del volumen de las posiciones...")
+            self._execute_partial_close_all(percentage=0.80)
             return
 
-        # --- TP 3: Asegurar otro 10% de la posición inicial ---
+        # --- TP 3: Asegurar otro 10% del total (50% de lo que queda vivo) ---
         if msg_lower.startswith("tp 3"):
-            if self.last_ticket:
-                self.logger.info("✂️ TP 3 alcanzado. Cerrando la mitad del volumen restante (10% del total)...")
-                # Pasamos 0.50 porque queremos la mitad del 20% que quedaba vivo
-                self._execute_partial_close(self.last_ticket, percentage=0.50)
-            else:
-                self.logger.warning("⚠️ TP 3 solicitado, pero no hay ticket activo en memoria.")
+            self.logger.info("✂️ TP 3 alcanzado. Reduciendo la mitad del volumen restante (10% del inicial)...")
+            self._execute_partial_close_all(percentage=0.50)
             return
             
         # --- Cierre total ---
-        if any(kw in msg_lower for kw in ["todos los tps", "posiciones cerradas"]):
-            if self.last_ticket:
-                self.logger.info("🛑 Comando de cierre total detectado. Cerrando el resto de la posición.")
-                self._execute_complete_close(self.last_ticket)
+        if any(kw in msg_lower for kw in ["todos los tps", "posiciones cerradas", "cerrar todo"]):
+            self.logger.info("🛑 Comando de cierre total detectado. Liquidando cartera Logan Gold...")
+            self._execute_complete_close_all()
             return
-        
+
         # 2. MAPEO DE SEÑAL NORMAL
         signal = self.mapper.map_message(message)
         if not signal:
             return
 
-        # 3. ENRUTADOR DE ACCIONES
+        # 3. ENRUTADOR DE ACCIONES ACTUALIZADO
         if signal.action in [TradeAction.BUY, TradeAction.SELL]:
-            self._execute_market_order(signal)
+            # Si es una entrada inmediata de pánico ("YA"), no tendrá rango de entrada (0.0)
+            if signal.entry_min == 0.0 and signal.entry_max == 0.0:
+                self._execute_market_order(signal)
+            else:
+                # Si contiene rango (ej: 3994 - 4000), es el bloque de parámetros estructurados
+                self._process_signal_parameters(signal)
             
         elif signal.action == TradeAction.BREAKEVEN:
-            self.logger.info("🛡️ Comando de Breakeven en vivo detectado para Logan. Protegiendo posición...")
+            self.logger.info("🛡️ Comando de Breakeven en vivo detectado. Protegiendo posiciones...")
             self._set_trades_to_breakeven()
 
     def _execute_market_order(self, signal: TradeSignal):
-        """Abre una posición instantánea a mercado y verifica el precio de apertura."""
+        """Abre una posición instantánea a mercado para el gatillo de pánico."""
         balance = self.executor.get_account_balance()
         if balance <= 0:
-            self.logger.error("❌ No se pudo obtener el balance para LoganGold.")
+            self.logger.error("❌ No se pudo obtener el balance de la cuenta para LoganGold.")
             return
 
-        # Lote proporcional específico de Logan (0.50 lotes para cuenta de 200k)
         calculated_lot = round(balance * 0.0000025, 2)
         lot = min(calculated_lot, self.max_lot_per_order)
         
@@ -88,14 +89,14 @@ class LoganGoldService(BaseService):
 
         self.logger.info(f"⚡ Lanzando orden instantánea LoganGold: {signal.action.name} {lot} lotes a {price}")
 
-        # Delegamos el envío puro de la orden al executor genérico
+        # Enviamos la orden al broker con TP 0.0 para gestionar las salidas de forma dinámica
         res = self.executor.send_order(
             symbol=symbol,
             order_type=order_type,
             volume=lot,
             price=price,
             sl=signal.stop_loss,
-            tp=signal.take_profits[0] if signal.take_profits else 0.0,
+            tp=0.0,  # Sin TP rígido para evitar cierres prematuros en MT5
             magic=self.magic_number,
             comment="LoganGold Immediate",
             is_market=True
@@ -103,10 +104,8 @@ class LoganGoldService(BaseService):
 
         if res:
             actual_price = res.price
-            
-            # --- SOLUCIÓN CRÍTICA: ANTI-PRECIO 0.0 ---
             if actual_price <= 0.0:
-                self.logger.warning("⚠️ Broker retornó precio 0.0. Recuperando desde MT5...")
+                self.logger.warning("⚠️ Broker retornó precio 0.0. Recuperando precio real de la API...")
                 for _ in range(5):
                     positions = self.executor.get_positions(ticket=res.order)
                     if positions:
@@ -114,47 +113,100 @@ class LoganGoldService(BaseService):
                         self.logger.info(f"🎯 Precio real recuperado de la posición viva: {actual_price}")
                         break
                     time.sleep(0.05)
-            
-            # Guardamos el ticket para futuros cierres parciales
-            self.last_ticket = res.order
-            self.logger.info(f"✅ Trade LoganGold vivo. Ticket: #{res.order}")
+            self.logger.info(f"✅ Trade instantáneo LoganGold vivo. Ticket: #{res.order}")
         else:
-            self.logger.error("❌ Fallo en la apertura de orden LoganGold.")
+            self.logger.error("❌ Fallo en la apertura de la orden instantánea de LoganGold.")
 
-    def _execute_partial_close(self, ticket: int, percentage: float = 0.5):
-        """Calcula el volumen correspondiente al porcentaje y solicita el cierre al ejecutor."""
-        positions = self.executor.get_positions(ticket=ticket)
-        if not positions:
-            self.logger.error(f"❌ No se localizó el Ticket #{ticket} para cierre parcial.")
-            return False
-            
-        pos = positions[0]
-        volume_to_close = round(pos.volume * percentage, 2)
+    def _process_signal_parameters(self, signal: TradeSignal):
+        """
+        Procesa el bloque de parámetros estructurados:
+        1. Modifica el SL del trade ya abierto en mercado con el "YA".
+        2. Deja un límite (Buy Limit o Sell Limit) en la zona extrema para cuando el precio rellene.
+        """
+        self.logger.info(f"📊 Procesando parámetros estructurados para {signal.symbol}...")
         
-        # Respetar el lote mínimo del broker
-        si = self.executor.get_symbol_info(pos.symbol)
-        min_vol = si.volume_min if si else 0.01
-        if volume_to_close < min_vol:
-            self.logger.warning(f"⚠️ El volumen a cerrar ({volume_to_close}) es menor al mínimo permitido.")
-            return False
+        # 1. ACTUALIZAR EL SL DE TODAS LAS OPERACIONES QUE YA ESTÉN ABIERTAS (del "YA")
+        active_positions = self.executor.get_positions(magic_number=self.magic_number)
+        if active_positions:
+            self.logger.info(f"🔄 Seteando Stop Loss a {signal.stop_loss} para {len(active_positions)} posiciones vivas...")
+            for pos in active_positions:
+                self.executor.modify_position_sl(pos.ticket, signal.stop_loss)
+        else:
+            self.logger.warning("⚠️ No se encontraron posiciones activas para ajustar el SL.")
 
-        success = self.executor.close_position(ticket, volume_to_close)
-        if success:
-            self.logger.info(f"✂️✅ Reducción del {percentage*100}% completada: {volume_to_close} lotes cerrados.")
-        return success
+        # 2. COLOCAR LA ORDEN LÍMITE EN LA PARTE ALTA/BAJA DE LA ZONA
+        symbol = signal.symbol if signal.symbol else "XAUUSD"
+        si = self.executor.get_symbol_info(symbol)
+        
+        # Calculamos el precio de la orden límite
+        # Para SELL: Colocamos Sell Limit en el extremo superior de la zona - 1.0 (ej: 4000 - 1.0 = 3999)
+        # Para BUY: Colocamos Buy Limit en el extremo inferior de la zona + 1.0 (ej: 3994 + 1.0 = 3995)
+        if signal.action == TradeAction.SELL:
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT
+            limit_price = signal.entry_max - 1.0
+        else:
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT
+            limit_price = signal.entry_min + 1.0
 
-    def _execute_complete_close(self, ticket: int):
-        """Cierra el 100% de la posición actual."""
-        positions = self.executor.get_positions(ticket=ticket)
+        # Lote proporcional idéntico al de mercado
+        balance = self.executor.get_account_balance()
+        calculated_lot = round(balance * 0.0000025, 2)
+        lot = min(calculated_lot, self.max_lot_per_order)
+        lot = max(lot, si.volume_min) if si else max(lot, 0.01)
+
+        self.logger.info(f"⏳ Colocando orden pendiente Limit en {symbol}: {limit_price} (SL: {signal.stop_loss})")
+        
+        # Enviamos la orden pendiente (TP en 0.0 para que no interfiera con el broker)
+        self.executor.send_order(
+            symbol=symbol,
+            order_type=order_type,
+            volume=lot,
+            price=limit_price,
+            sl=signal.stop_loss,
+            tp=0.0,
+            magic=self.magic_number,
+            comment="LoganGold Limit Zone",
+            is_market=False
+        )
+
+    def _execute_partial_close_all(self, percentage: float = 0.5):
+        """Cierra el porcentaje especificado de volumen en TODAS las posiciones activas de Logan."""
+        positions = self.executor.get_positions(magic_number=self.magic_number)
         if not positions:
-            return False
+            self.logger.warning("⚠️ No hay posiciones vivas en cartera de Logan para aplicar cierre parcial.")
+            return
+
+        for pos in positions:
+            volume_to_close = round(pos.volume * percentage, 2)
             
-        success = self.executor.close_position(ticket, positions[0].volume)
-        if success:
-            self.logger.info(f"🛑✅ Posición #{ticket} cerrada por completo.")
-            self.last_ticket = None  # Limpiamos el tracker
-        return success
-    
+            si = self.executor.get_symbol_info(pos.symbol)
+            min_vol = si.volume_min if si else 0.01
+            
+            # En caso de que el volumen restante sea minúsculo, cerramos todo el lote residual
+            if volume_to_close < min_vol:
+                self.logger.warning(f"⚠️ Volumen a cerrar ({volume_to_close}) menor que el mínimo. Forzando cierre completo para el Ticket #{pos.ticket}.")
+                volume_to_close = pos.volume
+
+            success = self.executor.close_position(pos.ticket, volume_to_close)
+            if success:
+                self.logger.info(f"✂️ Ticket #{pos.ticket}: {volume_to_close} lotes cerrados con éxito ({percentage*100}%).")
+
+    def _execute_complete_close_all(self):
+        """Cierra el 100% de todas las posiciones activas de Logan y limpia las pendientes."""
+        # 1. Liquidar trades vivos
+        positions = self.executor.get_positions(magic_number=self.magic_number)
+        if positions:
+            for pos in positions:
+                self.executor.close_position(pos.ticket, pos.volume)
+            self.logger.info("🛑 Todas las posiciones de Logan Gold han sido liquidadas de mercado.")
+        
+        # 2. Eliminar órdenes limit de la zona que no se hayan completado
+        pending_orders = self.executor.get_pending_orders(magic_number=self.magic_number)
+        if pending_orders:
+            for order in pending_orders:
+                self.executor.cancel_pending_order(order.ticket)
+            self.logger.info("🧹 Órdenes límite pendientes eliminadas de la zona.")
+
     def _set_trades_to_breakeven(self):
         """Mueve el Stop Loss de las posiciones activas de Logan al precio de entrada más colchón."""
         positions = self.executor.get_positions(magic_number=self.magic_number)
