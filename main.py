@@ -62,24 +62,35 @@ client = TelegramClient('trading_bot_session', API_ID, API_HASH)
 
 # --- ROUTER DE MENSAJES (EVENT HANDLER) ---
 
-@client.on(events.NewMessage(chats=list(services_registry.keys())))
-async def router_handler(event):
+async def delegate_to_service(event, is_edit: bool):
+    """Función centralizada para enrutar mensajes nuevos y editados a su servicio."""
     chat_id = event.chat_id
     message_text = event.raw_text
 
-    # Recuperamos el servicio específico para este chat ID
     service = services_registry.get(chat_id)
     if not service:
-        logger.warning(f"⚠️ Recibido mensaje de un canal no registrado: {chat_id}")
+        # Solo advertimos de canales no registrados si es un mensaje nuevo, para no spamear
+        if not is_edit:
+            logger.warning(f"⚠️ Recibido mensaje de un canal no registrado: {chat_id}")
         return
 
-    logger.info(f"📬 Nuevo mensaje en canal #{chat_id}. Delegando a {service.__class__.__name__}...")
+    logger.info(f"📬 {'✏️ Edición' if is_edit else 'Nuevo mensaje'} en canal #{chat_id}. Delegando a {service.__class__.__name__}...")
     
     try:
-        # Cada servicio procesa el mensaje bajo su propio contrato heredado de BaseService
-        await service.process_message(message_text)
+        # Inyectamos is_edit para que el servicio sepa cómo actuar
+        await service.process_message(message_text, is_edit=is_edit)
     except Exception as e:
-        logger.error(f"❌ Error grave procesando señal en {service.__class__.__name__}: {e}", exc_info=True)
+        logger.error(f"❌ Error grave procesando {'edición' if is_edit else 'señal'} en {service.__class__.__name__}: {e}", exc_info=True)
+
+
+@client.on(events.NewMessage(chats=list(services_registry.keys())))
+async def new_message_handler(event):
+    await delegate_to_service(event, is_edit=False)
+
+
+@client.on(events.MessageEdited(chats=list(services_registry.keys())))
+async def edited_message_handler(event):
+    await delegate_to_service(event, is_edit=True)
 
 
 # --- FLUJO PRINCIPAL DE INICIO ---

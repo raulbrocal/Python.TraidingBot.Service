@@ -8,6 +8,7 @@ class TradeAction(Enum):
     BREAKEVEN = "BREAKEVEN"
     CANCEL = "CANCEL"
     ACTIVATE = "ACTIVATE"
+    MOVE_SL = "MOVE_SL"
 
 @dataclass
 class TradeSignal:

@@ -92,6 +92,28 @@ class MT5Executor:
         res = mt5.order_send(request)
         return res.retcode == mt5.TRADE_RETCODE_DONE
 
+    def modify_position(self, ticket: int, sl: float, tp: float):
+        """Modifica el Stop Loss y el Take Profit de una posición viva simultáneamente."""
+        positions = self.get_positions(ticket=ticket)
+        if not positions:
+            logger.error(f"❌ No se encontró la posición #{ticket} para modificar SL/TP.")
+            return False
+            
+        pos = positions[0]
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": pos.symbol,
+            "sl": float(sl),
+            "tp": float(tp)
+        }
+        
+        res = mt5.order_send(request)
+        if res.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"❌ Error al modificar posición {ticket}: {res.comment} (Retcode: {res.retcode})")
+            return False
+        return True
+
     def close_position(self, ticket: int, volume_to_close: float):
         """Cierra total o parcialmente una posición."""
         positions = self.get_positions(ticket=ticket)
