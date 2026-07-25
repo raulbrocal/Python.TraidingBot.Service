@@ -218,13 +218,53 @@ class LoganGoldService(BaseService):
         order_type = mt5.ORDER_TYPE_SELL_LIMIT if pos_type == mt5.POSITION_TYPE_SELL else mt5.ORDER_TYPE_BUY_LIMIT
         
         balance = self.executor.get_account_balance()
-        vol = max(round(balance * 0.0000025, 2), si.volume_min if si else 0.01)
+        min_vol = si.volume_min if si else 0.01
+        
+        # Calcular el volumen total disponible
+        total_lot = min(round(balance * 0.0000025, 2), self.max_lot_per_order)
+        total_lot = max(total_lot, min_vol)
+        
+        # 1. Fraccionar el lote (80 / 10 / 10)
+        vol_a, vol_b, vol_c = self._calculate_lot_distribution(total_lot, min_vol)
 
-        self.logger.info(f"⏳ Colocando orden Limit en {limit_price}")
-        self.executor.send_order(
-            symbol=symbol, order_type=order_type, volume=vol, price=limit_price,
-            sl=signal.stop_loss, tp=0.0, magic=self.magic_number, comment="Logan Limit", is_market=False
-        )
+        # 2. Asignación Dinámica de TPs para Limits (Misma lógica que el YA)
+        tps = signal.take_profits
+        tp_a, tp_b, tp_c = 0.0, 0.0, 0.0
+        
+        if len(tps) >= 3:
+            tp_a = tps[1]  # Limit A (80%) -> TP2
+            tp_b = tps[2]  # Limit B (10%) -> TP3
+            # Si Logan envía un 4º TP (como en tu ejemplo 4036), va a la Orden C. Sino, offset.
+            if len(tps) >= 4:
+                tp_c = tps[3]
+            else:
+                offset = 30.0
+                tp_c = limit_price + offset if pos_type == mt5.POSITION_TYPE_BUY else limit_price - offset
+        elif len(tps) == 2:
+            tp_a = tps[0]  # Limit A (80%) -> TP1
+            tp_b = tps[1]  # Limit B (10%) -> TP2
+            offset = 30.0
+            tp_c = limit_price + offset if pos_type == mt5.POSITION_TYPE_BUY else limit_price - offset
+        elif len(tps) == 1:
+            tp_a = tp_b = tp_c = tps[0]
+            
+        # 3. Preparar la estructura de ejecución
+        orders = [
+            (vol_a, "Logan Limit A 80%", tp_a),
+            (vol_b, "Logan Limit B 10%", tp_b),
+            (vol_c, "Logan Limit C 10%", tp_c)
+        ]
+
+        self.logger.info(f"⏳ Colocando {sum(1 for v, _, _ in orders if v > 0)} órdenes Limit fraccionadas en {limit_price}")
+        
+        # 4. Lanzar las órdenes pendientes
+        for vol, comment, tp in orders:
+            if vol > 0:
+                self.executor.send_order(
+                    symbol=symbol, order_type=order_type, volume=vol, price=limit_price,
+                    sl=signal.stop_loss, tp=tp, magic=self.magic_number, comment=comment, is_market=False
+                )
+                time.sleep(0.1) # Evitar cuellos de botella en MT5
 
 
     # ---------------------------------------------------------

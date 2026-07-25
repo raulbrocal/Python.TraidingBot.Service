@@ -91,11 +91,21 @@ class LoganGoldMapper(BaseMapper):
             try:
                 symbol = "XAUUSD"
 
-                # Rango (Soporta comas y puntos. Ej: 4019.3 - 4024 o 4019,3)
-                range_match = re.search(r'(\d+(?:[\.,]\d+)?)\s*-\s*(\d+(?:[\.,]\d+)?)', msg_lower)
+                # Rango (Soporta comas, puntos, guiones y barras. Ej: 4019.3 - 4024 o 4115/20)
+                range_match = re.search(r'(\d+(?:[\.,]\d+)?)\s*(?:-|\/)\s*(\d+(?:[\.,]\d+)?)', msg_lower)
                 if range_match:
-                    e1 = float(range_match.group(1).replace(',', '.'))
-                    e2 = float(range_match.group(2).replace(',', '.'))
+                    e1_str = range_match.group(1).replace(',', '.')
+                    e2_str = range_match.group(2).replace(',', '.')
+                    
+                    e1 = float(e1_str)
+                    
+                    # Inteligencia para precios abreviados (Ej: "4115" y "20" -> reconstruye a "4120")
+                    if len(e2_str) < len(e1_str.split('.')[0]) and '.' not in e2_str:
+                        prefix = e1_str[:len(e1_str.split('.')[0]) - len(e2_str)]
+                        e2 = float(prefix + e2_str)
+                    else:
+                        e2 = float(e2_str)
+                        
                     entry_min, entry_max = min(e1, e2), max(e1, e2)
                 else:
                     entry_min = entry_max = 0.0

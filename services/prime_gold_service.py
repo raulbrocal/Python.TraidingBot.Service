@@ -16,7 +16,12 @@ class PrimeGoldService(BaseService):
         self.risk_percent = 0.5  # 0.5% de riesgo total por señal
         self.max_lot_per_order = 0.5 
 
-    async def process_message(self, message: str):
+    async def process_message(self, message: str, is_edit: bool = False):
+        # Ignoramos los mensajes editados para evitar re-ejecuciones accidentales
+        if is_edit:
+            self.logger.info("✍️ Edición detectada en Prime Gold. Ignorando...")
+            return
+
         self.logger.info("📩 Procesando mensaje del canal...")
         
         msg_lower = message.lower().strip()
