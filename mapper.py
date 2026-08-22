@@ -64,6 +64,13 @@ class PrimeGoldMapper(BaseMapper):
 
 
 class LoganGoldMapper(BaseMapper):
+    # Para XAUUSD con este broker, point=0.01 y 1 pip = 10 puntos -> 0.10.
+    # Si tu broker define el pip de otra forma para el oro, cambia esta constante.
+    PIP_SIZE_XAUUSD = 0.10
+    # Cuantos pips se suman/restan al ultimo TP numerico cuando el canal manda
+    # un ultimo TP "abierto" (sin nivel fijo), para tener siempre un numero usable.
+    OPEN_TP_OFFSET_PIPS = 100
+
     def map_message(self, message: str) -> TradeSignal | None:
         if not message:
             return None
@@ -91,11 +98,21 @@ class LoganGoldMapper(BaseMapper):
             try:
                 symbol = "XAUUSD"
 
-                # Rango (Soporta comas y puntos. Ej: 4019.3 - 4024 o 4019,3)
-                range_match = re.search(r'(\d+(?:[\.,]\d+)?)\s*-\s*(\d+(?:[\.,]\d+)?)', msg_lower)
+                # Rango (Soporta comas, puntos, guiones y barras. Ej: 4019.3 - 4024 o 4115/20)
+                range_match = re.search(r'(\d+(?:[\.,]\d+)?)\s*(?:-|\/)\s*(\d+(?:[\.,]\d+)?)', msg_lower)
                 if range_match:
-                    e1 = float(range_match.group(1).replace(',', '.'))
-                    e2 = float(range_match.group(2).replace(',', '.'))
+                    e1_str = range_match.group(1).replace(',', '.')
+                    e2_str = range_match.group(2).replace(',', '.')
+                    
+                    e1 = float(e1_str)
+                    
+                    # Inteligencia para precios abreviados (Ej: "4115" y "20" -> reconstruye a "4120")
+                    if len(e2_str) < len(e1_str.split('.')[0]) and '.' not in e2_str:
+                        prefix = e1_str[:len(e1_str.split('.')[0]) - len(e2_str)]
+                        e2 = float(prefix + e2_str)
+                    else:
+                        e2 = float(e2_str)
+                        
                     entry_min, entry_max = min(e1, e2), max(e1, e2)
                 else:
                     entry_min = entry_max = 0.0
@@ -104,10 +121,19 @@ class LoganGoldMapper(BaseMapper):
                 sl_match = re.search(r'sl\s*[:\s]*(\d+(?:[\.,]\d+)?)', msg_lower, re.I)
                 sl = float(sl_match.group(1).replace(',', '.')) if sl_match else 0.0
 
-                # Take Profits (Soporta "TP2 4020", sin ":" y con comas)
+                # Take Profits. Soporta "TP 4596", "TP1 4596", "TP 1 4596", "TP1: 4596",
                 tps = []
-                for tp_str in re.findall(r'tp\s*\d*\s*[:\s]*(\d+(?:[\.,]\d+)?)', msg_lower, re.I):
-                    tps.append(float(tp_str.replace(',', '.')))
+                for line in msg_lower.splitlines():
+                    for chunk in re.split(r'tp', line, flags=re.I)[1:]:
+                        if re.search(r'[a-z]', chunk):
+                            if tps:
+                                offset = self.OPEN_TP_OFFSET_PIPS * self.PIP_SIZE_XAUUSD
+                                synthetic = tps[-1] + offset if action == TradeAction.BUY else tps[-1] - offset
+                                tps.append(round(synthetic, 2))
+                            continue
+                        numbers = re.findall(r'\d+(?:[\.,]\d+)?', chunk)
+                        if numbers:
+                            tps.append(float(numbers[-1].replace(',', '.')))
 
                 return TradeSignal(
                     action=action,
