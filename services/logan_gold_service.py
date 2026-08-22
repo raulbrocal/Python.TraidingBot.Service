@@ -159,8 +159,13 @@ class LoganGoldService(BaseService):
         tick = self.executor.get_tick(symbol)
         if not tick: return
         
+        # Obtenemos el StopLevel del broker para evitar el error 10016
+        si = self.executor.get_symbol_info(symbol)
+        stop_level = si.trade_stops_level * si.point if si else 0.5 
+
         pos_type = active_positions[0].type
         current_price = tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask
+        open_price = active_positions[0].price_open
         
         # 1. ESCUDO ANTI-SLIPPAGE
         if signal.stop_loss > 0.0:
@@ -175,24 +180,33 @@ class LoganGoldService(BaseService):
                 self._execute_complete_close_all()
                 return
 
-        # 2. INYECTAR PARÁMETROS A LAS ÓRDENES VIVAS
-        self.logger.info(f"🔄 Inyectando SL ({signal.stop_loss}) y TPs a las órdenes vivas...")
+        # 2. LÓGICA ESTRUCTURAL DE TAKE PROFITS (Ignorar TP1, enfocar en TP2, TP3, TP4/Abierto)
+        self.logger.info(f"🔄 Inyectando SL ({signal.stop_loss}) y TPs estructurales a las órdenes vivas...")
         
-        # Lógica dinámica de asignación de TPs
         tps = signal.take_profits
-        tp_a = 0.0
-        tp_b = 0.0
+        tp_a, tp_b, tp_c = 0.0, 0.0, 0.0
         
-        if len(tps) >= 3:
-            tp_a = tps[1]  # Orden A (80%) -> TP2
-            tp_b = tps[2]  # Orden B (10%) -> TP3
-        elif len(tps) == 2:
-            tp_a = tps[0]  # Orden A (80%) -> TP1
-            tp_b = tps[1]  # Orden B (10%) -> TP2
+        # Orden A (80%) -> Sagrado al TP2 (Índice 1 de la lista)
+        if len(tps) >= 2:
+            tp_a = tps[1]
         elif len(tps) == 1:
-            tp_a = tps[0]  # Ambas al único TP
-            tp_b = tps[0]
+            tp_a = tps[0] # Fallback de seguridad
+            
+        # Orden B (10%) -> Siempre al TP3 (Índice 2)
+        if len(tps) >= 3:
+            tp_b = tps[2]
+        else:
+            tp_b = tp_a # Fallback
+            
+        # Orden C (10%) -> Al TP4 (Índice 3) o ABIERTO
+        if len(tps) >= 4:
+            tp_c = tps[3]
+        else:
+            # ABIERTO: Offset generoso desde el precio de apertura (+30 puntos)
+            offset = 30.0
+            tp_c = open_price + offset if pos_type == mt5.POSITION_TYPE_BUY else open_price - offset
 
+        # Inyectar a MetaTrader
         for pos in active_positions:
             target_tp = 0.0
             
@@ -201,10 +215,15 @@ class LoganGoldService(BaseService):
             elif "Logan B" in pos.comment:
                 target_tp = tp_b
             elif "Logan C" in pos.comment:
-                # TP Lejano (+30.0 puntos = 300 pips aprox en XAUUSD)
-                offset = 30.0
-                target_tp = pos.price_open + offset if pos.type == mt5.POSITION_TYPE_BUY else pos.price_open - offset
-                
+                target_tp = tp_c
+            
+            # VALIDACIÓN DE SEGURIDAD CONTRA ERROR 10016
+            if target_tp > 0:
+                diff = abs(target_tp - current_price)
+                if diff <= stop_level:
+                    self.logger.warning(f"⚠️ TP {target_tp} muy cerca del precio ({current_price}). Ajustando a distancia segura.")
+                    target_tp = (current_price + stop_level + 0.1) if pos.type == mt5.POSITION_TYPE_BUY else (current_price - stop_level - 0.1)
+
             self.executor.modify_position(pos.ticket, sl=signal.stop_loss, tp=target_tp)
 
         # 3. DEJAR ORDEN LÍMITE
@@ -218,13 +237,50 @@ class LoganGoldService(BaseService):
         order_type = mt5.ORDER_TYPE_SELL_LIMIT if pos_type == mt5.POSITION_TYPE_SELL else mt5.ORDER_TYPE_BUY_LIMIT
         
         balance = self.executor.get_account_balance()
-        vol = max(round(balance * 0.0000025, 2), si.volume_min if si else 0.01)
+        min_vol = si.volume_min if si else 0.01
+        
+        # Calcular el volumen total disponible
+        total_lot = min(round(balance * 0.0000025, 2), self.max_lot_per_order)
+        total_lot = max(total_lot, min_vol)
+        
+        # 1. Fraccionar el lote (80 / 10 / 10)
+        vol_a, vol_b, vol_c = self._calculate_lot_distribution(total_lot, min_vol)
 
-        self.logger.info(f"⏳ Colocando orden Limit en {limit_price}")
-        self.executor.send_order(
-            symbol=symbol, order_type=order_type, volume=vol, price=limit_price,
-            sl=signal.stop_loss, tp=0.0, magic=self.magic_number, comment="Logan Limit", is_market=False
-        )
+        # 2. LÓGICA ESTRUCTURAL DE TAKE PROFITS PARA LIMITS
+        tps = signal.take_profits
+        tp_a, tp_b, tp_c = 0.0, 0.0, 0.0
+        
+        # Limit A (80%) -> Sagrado al TP2
+        if len(tps) >= 2: tp_a = tps[1]
+        elif len(tps) == 1: tp_a = tps[0]
+            
+        # Limit B (10%) -> Al TP3
+        if len(tps) >= 3: tp_b = tps[2]
+        else: tp_b = tp_a
+
+        # Limit C (10%) -> Al TP4 o ABIERTO
+        if len(tps) >= 4: tp_c = tps[3]
+        else:
+            offset = 30.0
+            tp_c = limit_price + offset if pos_type == mt5.POSITION_TYPE_BUY else limit_price - offset
+            
+        # 3. Preparar la estructura de ejecución
+        orders = [
+            (vol_a, "Logan Limit A 80%", tp_a),
+            (vol_b, "Logan Limit B 10%", tp_b),
+            (vol_c, "Logan Limit C 10%", tp_c)
+        ]
+
+        self.logger.info(f"⏳ Colocando {sum(1 for v, _, _ in orders if v > 0)} órdenes Limit estructurales en {limit_price}")
+        
+        # 4. Lanzar las órdenes pendientes
+        for vol, comment, tp in orders:
+            if vol > 0:
+                self.executor.send_order(
+                    symbol=symbol, order_type=order_type, volume=vol, price=limit_price,
+                    sl=signal.stop_loss, tp=tp, magic=self.magic_number, comment=comment, is_market=False
+                )
+                time.sleep(0.1) # Evitar cuellos de botella en MT5
 
 
     # ---------------------------------------------------------
@@ -250,6 +306,7 @@ class LoganGoldService(BaseService):
             self.executor.modify_position_sl(pos.ticket, final_sl)
 
     def _set_trades_to_breakeven(self):
+        # 1. Proteger las posiciones activas pasándolas a Breakeven
         positions = self.executor.get_positions(magic_number=self.magic_number)
         for pos in positions:
             si = self.executor.get_symbol_info(pos.symbol)
@@ -261,6 +318,14 @@ class LoganGoldService(BaseService):
             if (pos.type == mt5.POSITION_TYPE_BUY and pos.sl < new_sl) or (pos.type == mt5.POSITION_TYPE_SELL and (pos.sl > new_sl or pos.sl == 0.0)):
                 self.executor.modify_position_sl(pos.ticket, new_sl)
                 self.logger.info(f"✅ SL de Ticket #{pos.ticket} blindado en {new_sl}")
+
+        # 2. Cancelar cualquier orden Limit pendiente (ya no son válidas)
+        pending = self.executor.get_pending_orders(magic_number=self.magic_number)
+        if pending:
+            self.logger.info(f"🗑️ Operación asegurada en BE. Cancelando {len(pending)} órdenes Limit pendientes...")
+            for order in pending:
+                self.executor.cancel_pending_order(order.ticket)
+                time.sleep(0.1) # Pausa de seguridad para no saturar MetaTrader
 
     def _execute_complete_close_all(self):
         positions = self.executor.get_positions(magic_number=self.magic_number)
