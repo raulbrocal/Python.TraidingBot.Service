@@ -148,6 +148,36 @@ class LoganGoldService(BaseService):
     # INYECCIÓN DE PARÁMETROS Y ESCUDO ANTI-SLIPPAGE
     # ---------------------------------------------------------
 
+    def _sanitize_tp(self, tp: float, ref_price: float, pos_type: int) -> float:
+        """Valida y corrige TPs invertidos o con erratas del analista (Ej: TP 4885 en SELL a 4490)."""
+        if tp <= 0.0 or ref_price <= 0.0:
+            return 0.0
+        
+        # Comprobar si el TP va en contra de la lógica de la posición
+        is_invalid = (pos_type == mt5.POSITION_TYPE_SELL and tp >= ref_price) or \
+                     (pos_type == mt5.POSITION_TYPE_BUY and tp <= ref_price)
+        
+        if is_invalid:
+            str_tp = str(int(tp))
+            str_ref = str(int(ref_price))
+            
+            # Si tienen la misma longitud (ej. 4885 y 4490), intentamos corregir el prefijo
+            if len(str_tp) == len(str_ref):
+                corrected_tp = float(str_ref[:2] + str_tp[2:] + ('.' + str(tp).split('.')[1] if '.' in str(tp) else ''))
+                
+                # Volvemos a validar si el TP corregido tiene sentido
+                still_invalid = (pos_type == mt5.POSITION_TYPE_SELL and corrected_tp >= ref_price) or \
+                                (pos_type == mt5.POSITION_TYPE_BUY and corrected_tp <= ref_price)
+                                
+                if not still_invalid:
+                    self.logger.warning(f"⚠️ Errata detectada en TP ({tp}). Corregido automáticamente a {corrected_tp}")
+                    return corrected_tp
+            
+            self.logger.error(f"❌ TP Inválido ({tp}) descartado para {'SELL' if pos_type == mt5.POSITION_TYPE_SELL else 'BUY'} en precio {ref_price}")
+            return 0.0 # Si no se puede corregir, se devuelve 0.0 para que MetaTrader no rechace la orden entera
+            
+        return tp
+
     def _process_signal_parameters(self, signal: TradeSignal):
         symbol = signal.symbol if signal.symbol else "XAUUSD"
         active_positions = self.executor.get_positions(magic_number=self.magic_number)
@@ -158,14 +188,9 @@ class LoganGoldService(BaseService):
 
         tick = self.executor.get_tick(symbol)
         if not tick: return
-        
-        # Obtenemos el StopLevel del broker para evitar el error 10016
-        si = self.executor.get_symbol_info(symbol)
-        stop_level = si.trade_stops_level * si.point if si else 0.5 
 
         pos_type = active_positions[0].type
         current_price = tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask
-        open_price = active_positions[0].price_open
         
         # 1. ESCUDO ANTI-SLIPPAGE
         if signal.stop_loss > 0.0:
@@ -180,53 +205,37 @@ class LoganGoldService(BaseService):
                 self._execute_complete_close_all()
                 return
 
-        # 2. LÓGICA ESTRUCTURAL DE TAKE PROFITS (Ignorar TP1, enfocar en TP2, TP3, TP4/Abierto)
-        self.logger.info(f"🔄 Inyectando SL ({signal.stop_loss}) y TPs estructurales a las órdenes vivas...")
-        
+        # 2. EXTRACCIÓN DIRECTA DE TAKE PROFITS (Sin fallbacks dinámicos ni modificaciones de distancia)
         tps = signal.take_profits
-        tp_a, tp_b, tp_c = 0.0, 0.0, 0.0
-        
-        # Orden A (80%) -> Sagrado al TP2 (Índice 1 de la lista)
-        if len(tps) >= 2:
-            tp_a = tps[1]
-        elif len(tps) == 1:
-            tp_a = tps[0] # Fallback de seguridad
-            
-        # Orden B (10%) -> Siempre al TP3 (Índice 2)
-        if len(tps) >= 3:
-            tp_b = tps[2]
-        else:
-            tp_b = tp_a # Fallback
-            
-        # Orden C (10%) -> Al TP4 (Índice 3) o ABIERTO
-        if len(tps) >= 4:
-            tp_c = tps[3]
-        else:
-            # ABIERTO: Offset generoso desde el precio de apertura (+30 puntos)
-            offset = 30.0
-            tp_c = open_price + offset if pos_type == mt5.POSITION_TYPE_BUY else open_price - offset
+        if not tps:
+            self.logger.error("❌ No se encontraron Take Profits en la señal enviada.")
+            return
 
-        # Inyectar a MetaTrader
-        for pos in active_positions:
-            target_tp = 0.0
-            
-            if "Logan A" in pos.comment:
-                target_tp = tp_a
-            elif "Logan B" in pos.comment:
-                target_tp = tp_b
-            elif "Logan C" in pos.comment:
-                target_tp = tp_c
-            
-            # VALIDACIÓN DE SEGURIDAD CONTRA ERROR 10016
-            if target_tp > 0:
-                diff = abs(target_tp - current_price)
-                if diff <= stop_level:
-                    self.logger.warning(f"⚠️ TP {target_tp} muy cerca del precio ({current_price}). Ajustando a distancia segura.")
-                    target_tp = (current_price + stop_level + 0.1) if pos.type == mt5.POSITION_TYPE_BUY else (current_price - stop_level - 0.1)
+        # TP2 (Índice 1 de la lista: 4483)
+        tp_a = tps[1] if len(tps) >= 2 else tps[0]
+        
+        # TP3 (Índice 2 de la lista: 4481)
+        tp_b = tps[2] if len(tps) >= 3 else tp_a
+        
+        # TP4 (Índice 3 de la lista: 4479)
+        tp_c = tps[3] if len(tps) >= 4 else tp_b
+
+        # 3. ASIGNACIÓN POR VOLUMEN (0.40 -> TP2, 0.05 -> TP3, 0.05 -> TP4)
+        sorted_positions = sorted(active_positions, key=lambda p: (p.volume, p.ticket), reverse=True)
+        targets = [tp_a, tp_b, tp_c]
+        
+        self.logger.info(f"🔄 Inyectando SL exacto ({signal.stop_loss}) y TPs: 0.40={tp_a}, 0.05={tp_b}, 0.05={tp_c}")
+
+        for i, pos in enumerate(sorted_positions):
+            target_tp = targets[i] if i < len(targets) else tp_a
+
+            # Misma sanitización que usan las Limit: si el TP viene invertido/con
+            # errata de tecleo, intenta corregirlo antes de descartarlo a 0.0.
+            target_tp = self._sanitize_tp(target_tp, pos.price_open, pos_type)
 
             self.executor.modify_position(pos.ticket, sl=signal.stop_loss, tp=target_tp)
 
-        # 3. DEJAR ORDEN LÍMITE
+        # 4. DEJAR ORDEN LÍMITE
         self._place_limit_order(signal, symbol, pos_type)
 
     def _place_limit_order(self, signal, symbol, pos_type):
@@ -239,7 +248,6 @@ class LoganGoldService(BaseService):
         balance = self.executor.get_account_balance()
         min_vol = si.volume_min if si else 0.01
         
-        # Calcular el volumen total disponible
         total_lot = min(round(balance * 0.0000025, 2), self.max_lot_per_order)
         total_lot = max(total_lot, min_vol)
         
@@ -250,19 +258,21 @@ class LoganGoldService(BaseService):
         tps = signal.take_profits
         tp_a, tp_b, tp_c = 0.0, 0.0, 0.0
         
-        # Limit A (80%) -> Sagrado al TP2
         if len(tps) >= 2: tp_a = tps[1]
         elif len(tps) == 1: tp_a = tps[0]
             
-        # Limit B (10%) -> Al TP3
         if len(tps) >= 3: tp_b = tps[2]
         else: tp_b = tp_a
 
-        # Limit C (10%) -> Al TP4 o ABIERTO
         if len(tps) >= 4: tp_c = tps[3]
         else:
             offset = 30.0
             tp_c = limit_price + offset if pos_type == mt5.POSITION_TYPE_BUY else limit_price - offset
+
+        # Saneamiento de erratas en los TPs
+        tp_a = self._sanitize_tp(tp_a, limit_price, pos_type)
+        tp_b = self._sanitize_tp(tp_b, limit_price, pos_type)
+        tp_c = self._sanitize_tp(tp_c, limit_price, pos_type)
             
         # 3. Preparar la estructura de ejecución
         orders = [
@@ -280,7 +290,7 @@ class LoganGoldService(BaseService):
                     symbol=symbol, order_type=order_type, volume=vol, price=limit_price,
                     sl=signal.stop_loss, tp=tp, magic=self.magic_number, comment=comment, is_market=False
                 )
-                time.sleep(0.1) # Evitar cuellos de botella en MT5
+                time.sleep(0.1)
 
 
     # ---------------------------------------------------------
