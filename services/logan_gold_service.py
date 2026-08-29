@@ -221,7 +221,11 @@ class LoganGoldService(BaseService):
         tp_c = tps[3] if len(tps) >= 4 else tp_b
 
         # 3. ASIGNACIÓN POR VOLUMEN (0.40 -> TP2, 0.05 -> TP3, 0.05 -> TP4)
-        sorted_positions = sorted(active_positions, key=lambda p: (p.volume, p.ticket), reverse=True)
+        # Orden DESC por volumen (la de 0.40 siempre primero) y, en empate de
+        # volumen entre B y C (ambas 0.05), ASC por ticket -> la que se abrio
+        # primero (B) entra antes que la que se abrio despues (C), igual que
+        # el orden cronologico con el que se crearon en _execute_split_market_orders.
+        sorted_positions = sorted(active_positions, key=lambda p: (-p.volume, p.ticket))
         targets = [tp_a, tp_b, tp_c]
         
         self.logger.info(f"🔄 Inyectando SL exacto ({signal.stop_loss}) y TPs: 0.40={tp_a}, 0.05={tp_b}, 0.05={tp_c}")
@@ -243,8 +247,28 @@ class LoganGoldService(BaseService):
         if signal.entry_min == 0.0 or signal.entry_max == 0.0: return
 
         limit_price = signal.entry_max - 1.0 if pos_type == mt5.POSITION_TYPE_SELL else signal.entry_min + 1.0
-        order_type = mt5.ORDER_TYPE_SELL_LIMIT if pos_type == mt5.POSITION_TYPE_SELL else mt5.ORDER_TYPE_BUY_LIMIT
-        
+
+        # ESCUDO DE RE-ENTRADA INVERTIDA: un SELL_LIMIT solo es valido si el
+        # precio de la limit esta POR ENCIMA o DEBAJO del precio actual.
+        # En ese caso, en vez de la Limit, ejecutamos las 3 posiciones A MERCADO
+        tick = self.executor.get_tick(symbol)
+        current_price = (tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask) if tick else None
+
+        execute_as_market = False
+        exec_price = limit_price
+        if current_price is not None:
+            if pos_type == mt5.POSITION_TYPE_SELL and current_price > limit_price:
+                execute_as_market = True
+                exec_price = current_price
+            elif pos_type == mt5.POSITION_TYPE_BUY and current_price < limit_price:
+                execute_as_market = True
+                exec_price = current_price
+
+        if execute_as_market:
+            order_type = mt5.ORDER_TYPE_SELL if pos_type == mt5.POSITION_TYPE_SELL else mt5.ORDER_TYPE_BUY
+        else:
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT if pos_type == mt5.POSITION_TYPE_SELL else mt5.ORDER_TYPE_BUY_LIMIT
+
         balance = self.executor.get_account_balance()
         min_vol = si.volume_min if si else 0.01
         
@@ -254,7 +278,7 @@ class LoganGoldService(BaseService):
         # 1. Fraccionar el lote (80 / 10 / 10)
         vol_a, vol_b, vol_c = self._calculate_lot_distribution(total_lot, min_vol)
 
-        # 2. LÓGICA ESTRUCTURAL DE TAKE PROFITS PARA LIMITS
+        # 2. LÓGICA ESTRUCTURAL DE TAKE PROFITS PARA LIMITS (o para el fallback a mercado)
         tps = signal.take_profits
         tp_a, tp_b, tp_c = 0.0, 0.0, 0.0
         
@@ -267,28 +291,37 @@ class LoganGoldService(BaseService):
         if len(tps) >= 4: tp_c = tps[3]
         else:
             offset = 30.0
-            tp_c = limit_price + offset if pos_type == mt5.POSITION_TYPE_BUY else limit_price - offset
+            tp_c = exec_price + offset if pos_type == mt5.POSITION_TYPE_BUY else exec_price - offset
 
-        # Saneamiento de erratas en los TPs
-        tp_a = self._sanitize_tp(tp_a, limit_price, pos_type)
-        tp_b = self._sanitize_tp(tp_b, limit_price, pos_type)
-        tp_c = self._sanitize_tp(tp_c, limit_price, pos_type)
-            
+        # Saneamiento de erratas en los TPs, contra el precio de ejecucion real
+        tp_a = self._sanitize_tp(tp_a, exec_price, pos_type)
+        tp_b = self._sanitize_tp(tp_b, exec_price, pos_type)
+        tp_c = self._sanitize_tp(tp_c, exec_price, pos_type)
+
         # 3. Preparar la estructura de ejecución
+        label = "ReEntry" if execute_as_market else "Limit"
         orders = [
-            (vol_a, "Logan Limit A 80%", tp_a),
-            (vol_b, "Logan Limit B 10%", tp_b),
-            (vol_c, "Logan Limit C 10%", tp_c)
+            (vol_a, f"Logan {label} A 80%", tp_a),
+            (vol_b, f"Logan {label} B 10%", tp_b),
+            (vol_c, f"Logan {label} C 10%", tp_c)
         ]
 
-        self.logger.info(f"⏳ Colocando {sum(1 for v, _, _ in orders if v > 0)} órdenes Limit estructurales en {limit_price}")
+        if execute_as_market:
+            self.logger.warning(
+                f"⚠️ El precio ({current_price}) ya rebasó el nivel de re-entrada ({limit_price}) "
+                f"antes de poder colocar la Limit. Ejecutando las 3 órdenes A MERCADO en su lugar, "
+                f"con SL={signal.stop_loss} y TP puestos desde ya."
+            )
+        else:
+            self.logger.info(f"⏳ Colocando {sum(1 for v, _, _ in orders if v > 0)} órdenes Limit estructurales en {limit_price}")
         
-        # 4. Lanzar las órdenes pendientes
+        # 4. Lanzar las órdenes
         for vol, comment, tp in orders:
             if vol > 0:
                 self.executor.send_order(
-                    symbol=symbol, order_type=order_type, volume=vol, price=limit_price,
-                    sl=signal.stop_loss, tp=tp, magic=self.magic_number, comment=comment, is_market=False
+                    symbol=symbol, order_type=order_type, volume=vol, price=exec_price,
+                    sl=signal.stop_loss, tp=tp, magic=self.magic_number, comment=comment,
+                    is_market=execute_as_market
                 )
                 time.sleep(0.1)
 

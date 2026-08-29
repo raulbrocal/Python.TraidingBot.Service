@@ -71,6 +71,11 @@ class LoganGoldMapper(BaseMapper):
     # un ultimo TP "abierto" (sin nivel fijo), para tener siempre un numero usable.
     OPEN_TP_OFFSET_PIPS = 100
 
+    BE_EXCEPTION_PHRASES = [
+        "en tp1 muevo sl a be",
+        "me he equivocado al poner sl en be y lo acabo de poner",
+    ]
+
     def map_message(self, message: str) -> TradeSignal | None:
         if not message:
             return None
@@ -85,8 +90,11 @@ class LoganGoldMapper(BaseMapper):
                 return TradeSignal(action=TradeAction.SELL, symbol="XAUUSD", raw_message=message)
 
         # 2. Gestión de Breakeven
+        msg_for_be_check = re.sub(r'tp\s+(\d)', r'tp\1', msg_lower)
+        is_be_exception = any(phrase in msg_for_be_check for phrase in self.BE_EXCEPTION_PHRASES)
+
         be_keywords = ["be", "muevan sl a be", "sl a be"]
-        if any(keyword == msg_lower or keyword in msg_lower for keyword in be_keywords):
+        if not is_be_exception and any(keyword == msg_lower or keyword in msg_lower for keyword in be_keywords):
             return TradeSignal(action=TradeAction.BREAKEVEN, symbol="XAUUSD", raw_message=message)
 
         # 3. Procesar Señal Estándar de Parámetros
