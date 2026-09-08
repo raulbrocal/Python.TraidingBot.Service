@@ -11,10 +11,19 @@ class LoganGoldService(BaseService):
         super().__init__(channel_id, executor)
         self.mapper = mapper
         self.magic_number = 202611
-        self.max_lot_per_order = 0.50 
+        self.max_lot_per_order = 0.50
+        # Diferencia maxima (en puntos de precio) que se tolera entre el SL que
+        # ya tenian las posiciones y un SL nuevo llegado en un mensaje NUEVO
+        # (no edicion) antes de considerarlo sospechoso. Ajustalo si ves falsos
+        # positivos o si quieres ser mas estricto.
+        self.max_sl_jump_points = 20.0
 
     async def process_message(self, message: str, is_edit: bool = False):
         self.logger.info(f"📩 Procesando {'EDICIÓN' if is_edit else 'MENSAJE'} de Logan Gold...")
+        # Sin este log, un incidente como el de hoy es indiagnosticable: el log
+        # solo decía "Procesando MENSAJE", nunca QUÉ decía el mensaje. Con esto,
+        # la próxima vez se puede ver el texto exacto que disparó cada acción.
+        self.logger.info(f"📝 Texto: {message!r}")
         msg_lower = message.lower().strip()
         
         # 1. FILTROS RÁPIDOS DE EVENTOS (Solo para mensajes nuevos)
@@ -191,7 +200,20 @@ class LoganGoldService(BaseService):
 
         pos_type = active_positions[0].type
         current_price = tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask
-        
+
+        # 0. GUARDIÁN DE PLAUSIBILIDAD DEL SL
+        existing_sls = {pos.sl for pos in active_positions if pos.sl and pos.sl > 0.0}
+        if signal.stop_loss > 0.0 and existing_sls:
+            max_deviation = max(abs(signal.stop_loss - sl) for sl in existing_sls)
+            if max_deviation > self.max_sl_jump_points:
+                self.logger.error(
+                    f"🚨 SL SOSPECHOSO: llega SL={signal.stop_loss} pero las posiciones ya "
+                    f"tenían SL≈{sorted(existing_sls)} ({max_deviation:.1f} puntos de diferencia, "
+                    f"máximo permitido {self.max_sl_jump_points}). Este mensaje debería haber sido "
+                    f"una EDICIÓN, no uno nuevo -- ignorando por seguridad, no toco ni cierro nada."
+                )
+                return
+
         # 1. ESCUDO ANTI-SLIPPAGE
         if signal.stop_loss > 0.0:
             breached = False
@@ -248,9 +270,7 @@ class LoganGoldService(BaseService):
 
         limit_price = signal.entry_max - 1.0 if pos_type == mt5.POSITION_TYPE_SELL else signal.entry_min + 1.0
 
-        # ESCUDO DE RE-ENTRADA INVERTIDA: un SELL_LIMIT solo es valido si el
-        # precio de la limit esta POR ENCIMA o DEBAJO del precio actual.
-        # En ese caso, en vez de la Limit, ejecutamos las 3 posiciones A MERCADO
+        # ESCUDO DE RE-ENTRADA INVERTIDA
         tick = self.executor.get_tick(symbol)
         current_price = (tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask) if tick else None
 
