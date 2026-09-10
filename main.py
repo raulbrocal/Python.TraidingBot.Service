@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import asyncio
 
@@ -33,6 +34,11 @@ MT5_SERVER = os.getenv("MT5_SERVER")
 PRIME_GOLD_ID = os.getenv("PRIME_GOLD_CHANNEL_ID")
 LOGAN_GOLD_ID = os.getenv("LOGAN_GOLD_CHANNEL_ID")
 
+# A dónde se mandan los avisos de ERROR/CRITICAL por Telegram. "me" = tus
+# Mensajes Guardados (no requiere configurar nada más). Si prefieres un chat o
+# canal privado dedicado a avisos, pon aquí su chat_id en el .env.
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID", "me")
+
 if not all([API_ID, API_HASH, MT5_ACCOUNT, MT5_PASSWORD, MT5_SERVER, PRIME_GOLD_ID, LOGAN_GOLD_ID]):
     logger.critical("❌ Faltan configurar variables críticas en el archivo .env. Abortando inicio.")
     exit(1)
@@ -58,6 +64,47 @@ services_registry = {
 
 # 3. Inicializamos el cliente de Telegram
 client = TelegramClient('trading_bot_session', API_ID, API_HASH)
+
+
+# --- AVISOS POR TELEGRAM PARA ERRORES CRÍTICOS ---
+class TelegramAlertHandler(logging.Handler):
+    """
+    Handler de logging adicional: cualquier log de nivel ERROR o superior
+    (en CUALQUIER logger del proyecto, no solo MainOrchestrator -- incluye
+    LoganGoldService, PrimeGoldService, etc.) se manda también por Telegram,
+    además de quedar en bot.log como siempre. Así te enteras al momento desde
+    el móvil de un "SLIPPAGE CRÍTICO", un "SL SOSPECHOSO" o un fallo de
+    conexión, sin tener que ir a mirar el log a mano.
+
+    Si todavía no hay un loop de asyncio corriendo (p.ej. un error muy al
+    principio, antes de conectar a Telegram) o si el envío falla (p.ej. sin
+    internet en ese instante), se omite en silencio -- el aviso solo se
+    pierde por Telegram, nunca deja de escribirse en bot.log.
+    """
+    def __init__(self, client: TelegramClient, target, level=logging.ERROR):
+        super().__init__(level=level)
+        self.client = client
+        self.target = target
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+        except Exception:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._send_safe(msg))
+
+    async def _send_safe(self, text: str):
+        try:
+            await self.client.send_message(self.target, text[:4000])
+        except Exception:
+            pass
+
+
+logging.getLogger().addHandler(TelegramAlertHandler(client, ALERT_CHAT_ID, level=logging.ERROR))
 
 
 # --- ROUTER DE MENSAJES (EVENT HANDLER) ---
@@ -93,31 +140,65 @@ async def edited_message_handler(event):
     await delegate_to_service(event, is_edit=True)
 
 
+# --- CONEXIÓN CON REINTENTOS ---
+async def connect_mt5_with_retry(delay_seconds: int = 15):
+    attempt = 0
+    while True:
+        attempt += 1
+        logger.info(f"🔌 Conectando a MetaTrader 5 (Servidor: {MT5_SERVER}, intento {attempt})...")
+        try:
+            if executor.connect():
+                logger.info("✅ Conexión establecida con éxito con MetaTrader 5.")
+                return
+        except Exception as e:
+            logger.warning(f"⚠️ Excepción conectando a MT5 (intento {attempt}): {e}")
+        logger.warning(f"⚠️ Fallo al conectar con MT5 (intento {attempt}). Reintentando en {delay_seconds}s...")
+        await asyncio.sleep(delay_seconds)
+
+
+async def start_telegram_with_retry(delay_seconds: int = 15):
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            logger.info(f"📲 Conectando a la API de Telegram y autenticando sesión (intento {attempt})...")
+            await client.start()
+            logger.info("✅ Telegram conectado con éxito. Escuchando canales activos...")
+            return
+        except Exception as e:
+            logger.warning(f"⚠️ Fallo al conectar con Telegram (intento {attempt}): {e}. Reintentando en {delay_seconds}s...")
+            await asyncio.sleep(delay_seconds)
+
+
 # --- FLUJO PRINCIPAL DE INICIO ---
 
 async def main():
     logger.info("🚀 Iniciando Sistema de Trading Algorítmico...")
 
-    # 1. Conexión y Login en MetaTrader 5
-    logger.info(f"🔌 Conectando a MetaTrader 5 (Servidor: {MT5_SERVER})...")
-    if not executor.connect():
-        logger.critical("❌ ERROR CRÍTICO: Imposible conectar o loguearse en MetaTrader 5. Abortando.")
-        return
-    logger.info("✅ Conexión establecida con éxito con MetaTrader 5.")
+    await connect_mt5_with_retry()
+    await start_telegram_with_retry()
 
-    # 2. Arranque del listener de Telegram
-    logger.info("📲 Conectando a la API de Telegram y autenticando sesión...")
-    await client.start()
-    logger.info("✅ Telegram conectado con éxito. Escuchando canales activos...")
+    # Aviso de arranque -- si esto llega a tus Mensajes Guardados, sabes que
+    # el bot se levantó bien tras el corte de luz (o el reinicio que sea).
+    try:
+        await client.send_message(ALERT_CHAT_ID, "✅ Bot de trading iniciado y escuchando canales.")
+    except Exception:
+        pass
 
     # Mantener el loop de Telethon vivo de forma asíncrona
     await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 Ejecución del bot detenida manualmente por el usuario.")
-    except Exception as e:
-        logger.critical(f"❌ Error fatal imprevisto en el bucle principal: {e}", exc_info=True)
+    RESTART_DELAY_SECONDS = 30
+    while True:
+        try:
+            asyncio.run(main())
+            logger.warning(f"⚠️ El bucle principal terminó de forma inesperada. Reiniciando en {RESTART_DELAY_SECONDS}s...")
+        except KeyboardInterrupt:
+            logger.info("🛑 Ejecución del bot detenida manualmente por el usuario.")
+            break
+        except Exception as e:
+            logger.critical(f"❌ Error fatal imprevisto en el bucle principal: {e}", exc_info=True)
+            logger.warning(f"⚠️ Reiniciando en {RESTART_DELAY_SECONDS}s...")
+        time.sleep(RESTART_DELAY_SECONDS)

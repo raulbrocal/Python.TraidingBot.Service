@@ -17,6 +17,11 @@ class LoganGoldService(BaseService):
         # (no edicion) antes de considerarlo sospechoso. Ajustalo si ves falsos
         # positivos o si quieres ser mas estricto.
         self.max_sl_jump_points = 20.0
+        # A partir de cuantos puntos de distancia entre el precio real de
+        # ejecucion y el rango de entrada declarado se considera que hay un
+        # error sistematico en TODO el bloque de precios (rango+SL+TPs), no
+        # solo una diferencia normal. Ajustalo si ves falsos positivos.
+        self.price_block_sanity_threshold = 40.0
 
     async def process_message(self, message: str, is_edit: bool = False):
         self.logger.info(f"📩 Procesando {'EDICIÓN' if is_edit else 'MENSAJE'} de Logan Gold...")
@@ -81,15 +86,20 @@ class LoganGoldService(BaseService):
 
     def _update_existing_positions(self, signal: TradeSignal):
         """Busca posiciones activas y actualiza el SL según el mensaje editado."""
-        if signal.stop_loss <= 0.0:
-            return
-            
-        self.logger.info("✍️ Mensaje editado con SL detectado. Evaluando actualizar posiciones activas...")
-        
         active_positions = self.executor.get_positions(magic_number=self.magic_number)
         if not active_positions:
-            self.logger.warning("⚠️ Logan editó un mensaje, pero no hay posiciones activas para este canal.")
+            if signal.stop_loss > 0.0:
+                self.logger.warning("⚠️ Logan editó un mensaje, pero no hay posiciones activas para este canal.")
             return
+
+        # Una edición también puede traer el mismo error sistemático de
+        # bloque completo (rango+SL+TPs desplazados) que un mensaje nuevo.
+        self._reconcile_signal_with_market(signal, active_positions[0].price_open)
+
+        if signal.stop_loss <= 0.0:
+            return
+
+        self.logger.info("✍️ Mensaje editado con SL detectado. Evaluando actualizar posiciones activas...")
 
         for pos in active_positions:
             if pos.sl != signal.stop_loss:
@@ -187,6 +197,44 @@ class LoganGoldService(BaseService):
             
         return tp
 
+    def _reconcile_signal_with_market(self, signal: TradeSignal, reference_price: float):
+        if signal.entry_min <= 0.0 or signal.entry_max <= 0.0 or reference_price <= 0.0:
+            return
+
+        if reference_price < signal.entry_min:
+            raw_offset = signal.entry_min - reference_price
+        elif reference_price > signal.entry_max:
+            raw_offset = signal.entry_max - reference_price
+        else:
+            return  # el precio real cae DENTRO del rango declarado -> nada que corregir
+
+        if abs(raw_offset) < self.price_block_sanity_threshold:
+            return  # se sale del rango pero por poco, dentro de lo normal
+
+        offset = round(raw_offset / 50.0) * 50.0
+        if offset == 0.0:
+            return
+
+        self.logger.error(
+            f"⚠️ CORRECCIÓN AUTOMÁTICA DE BLOQUE DE PRECIOS: el rango declarado "
+            f"({signal.entry_min}-{signal.entry_max}) está a {abs(raw_offset):.1f} puntos del "
+            f"precio real de ejecución ({reference_price}). Aplicando {-offset:+.0f} puntos "
+            f"a rango, SL y TPs por igual."
+        )
+        self.logger.info(
+            f"   Antes:   rango=({signal.entry_min}, {signal.entry_max}) sl={signal.stop_loss} tps={signal.take_profits}"
+        )
+
+        signal.entry_min = round(signal.entry_min - offset, 2)
+        signal.entry_max = round(signal.entry_max - offset, 2)
+        if signal.stop_loss > 0.0:
+            signal.stop_loss = round(signal.stop_loss - offset, 2)
+        signal.take_profits = [round(tp - offset, 2) for tp in signal.take_profits]
+
+        self.logger.info(
+            f"   Después: rango=({signal.entry_min}, {signal.entry_max}) sl={signal.stop_loss} tps={signal.take_profits}"
+        )
+
     def _process_signal_parameters(self, signal: TradeSignal):
         symbol = signal.symbol if signal.symbol else "XAUUSD"
         active_positions = self.executor.get_positions(magic_number=self.magic_number)
@@ -200,6 +248,9 @@ class LoganGoldService(BaseService):
 
         pos_type = active_positions[0].type
         current_price = tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask
+
+        # -1. RECONCILIACIÓN DEL BLOQUE DE PRECIOS CONTRA EL PRECIO REAL
+        self._reconcile_signal_with_market(signal, active_positions[0].price_open)
 
         # 0. GUARDIÁN DE PLAUSIBILIDAD DEL SL
         existing_sls = {pos.sl for pos in active_positions if pos.sl and pos.sl > 0.0}
@@ -270,7 +321,7 @@ class LoganGoldService(BaseService):
 
         limit_price = signal.entry_max - 1.0 if pos_type == mt5.POSITION_TYPE_SELL else signal.entry_min + 1.0
 
-        # ESCUDO DE RE-ENTRADA INVERTIDA
+        # ESCUDO DE RE-ENTRADA INVERTIDA: un SELL_LIMIT solo es valido si el
         tick = self.executor.get_tick(symbol)
         current_price = (tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask) if tick else None
 
