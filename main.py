@@ -8,7 +8,7 @@ from telethon import TelegramClient, events
 from executor import MT5Executor
 from mapper import PrimeGoldMapper, LoganGoldMapper
 from services.prime_gold_service import PrimeGoldService
-from services.logan_gold_service import LoganGoldService
+from services.logan_gold_service import LoganGoldService, MILESTONE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +67,7 @@ client = TelegramClient('trading_bot_session', API_ID, API_HASH)
 
 
 # --- AVISOS POR TELEGRAM PARA ERRORES CRÍTICOS ---
+
 class TelegramAlertHandler(logging.Handler):
     """
     Handler de logging adicional: cualquier log de nivel ERROR o superior
@@ -77,16 +78,23 @@ class TelegramAlertHandler(logging.Handler):
     conexión, sin tener que ir a mirar el log a mano.
 
     Si todavía no hay un loop de asyncio corriendo (p.ej. un error muy al
-    principio, antes de conectar a Telegram) o si el envío falla (p.ej. sin
-    internet en ese instante), se omite en silencio -- el aviso solo se
-    pierde por Telegram, nunca deja de escribirse en bot.log.
+    principio, antes de conectar a Telegram) el aviso se omite en silencio
+    -- nunca deja de escribirse en bot.log. Si el ENVÍO falla (p.ej. sin
+    internet en ese instante, o Telegram no reconoce aún el chat_id de
+    destino), queda registrado como WARNING en el log normal -- nunca por
+    Telegram, para no entrar en bucle avisando de que no se pudo avisar.
     """
+    _LOGGER_NAME = "TelegramAlertHandler"
+
     def __init__(self, client: TelegramClient, target, level=logging.ERROR):
         super().__init__(level=level)
         self.client = client
         self.target = target
+        self._diag = logging.getLogger(self._LOGGER_NAME)
 
     def emit(self, record: logging.LogRecord):
+        if record.name == self._LOGGER_NAME:
+            return  # evita bucle infinito si el aviso de un fallo de envío vuelve a fallar
         try:
             msg = self.format(record)
         except Exception:
@@ -100,11 +108,11 @@ class TelegramAlertHandler(logging.Handler):
     async def _send_safe(self, text: str):
         try:
             await self.client.send_message(self.target, text[:4000])
-        except Exception:
-            pass
+        except Exception as e:
+            self._diag.warning(f"No se pudo enviar el aviso por Telegram a '{self.target}': {e}")
 
 
-logging.getLogger().addHandler(TelegramAlertHandler(client, ALERT_CHAT_ID, level=logging.ERROR))
+logging.getLogger().addHandler(TelegramAlertHandler(client, ALERT_CHAT_ID, level=MILESTONE))
 
 
 # --- ROUTER DE MENSAJES (EVENT HANDLER) ---

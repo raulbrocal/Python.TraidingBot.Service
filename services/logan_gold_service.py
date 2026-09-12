@@ -6,6 +6,15 @@ from services.base_service import BaseService
 
 logger = logging.getLogger(__name__)
 
+# Nivel intermedio entre INFO (20) y WARNING (30): marca "hitos importantes"
+# (YA, parámetros aplicados, BE, cierres) que sí quieres ver por Telegram,
+# sin llegar al ruido de cada línea INFO normal (mensajes recibidos, texto
+# crudo, confirmaciones por posición individual...). Los ERROR/CRITICAL de
+# siempre (slippage, SL sospechoso, corrección de bloque) ya quedan por
+# encima de este nivel, así que se siguen mandando igual sin tocar nada.
+MILESTONE = 25
+logging.addLevelName(MILESTONE, "MILESTONE")
+
 class LoganGoldService(BaseService):
     def __init__(self, channel_id: int, mapper, executor):
         super().__init__(channel_id, executor)
@@ -40,7 +49,7 @@ class LoganGoldService(BaseService):
 
             # --- TP 2: Auto-Breakeven ---
             if "tp 2" in msg_lower:
-                self.logger.info("✂️ TP 2 detectado. Protegiendo el resto a Breakeven...")
+                self.logger.log(MILESTONE, "✂️ TP 2 detectado. Protegiendo el resto a Breakeven...")
                 self._set_trades_to_breakeven()
                 return
 
@@ -50,7 +59,7 @@ class LoganGoldService(BaseService):
                 return
                 
             if any(kw in msg_lower for kw in ["todos los tps", "posiciones cerradas", "cerrar todo"]):
-                self.logger.info("🛑 Comando de cierre total detectado. Liquidando runners de Logan Gold...")
+                self.logger.log(MILESTONE, "🛑 Comando de cierre total detectado. Liquidando runners de Logan Gold...")
                 self._execute_complete_close_all()
                 return
 
@@ -72,7 +81,7 @@ class LoganGoldService(BaseService):
                     self._process_signal_parameters(signal)
                 
         elif signal.action == TradeAction.BREAKEVEN:
-            self.logger.info("🛡️ Comando de Breakeven explícito detectado. Protegiendo posiciones...")
+            self.logger.log(MILESTONE, "🛡️ Comando de Breakeven explícito detectado. Protegiendo posiciones...")
             self._set_trades_to_breakeven()
             
         elif signal.action == TradeAction.MOVE_SL:
@@ -99,7 +108,7 @@ class LoganGoldService(BaseService):
         if signal.stop_loss <= 0.0:
             return
 
-        self.logger.info("✍️ Mensaje editado con SL detectado. Evaluando actualizar posiciones activas...")
+        self.logger.log(MILESTONE, "✍️ Mensaje editado con SL detectado. Evaluando actualizar posiciones activas...")
 
         for pos in active_positions:
             if pos.sl != signal.stop_loss:
@@ -146,7 +155,7 @@ class LoganGoldService(BaseService):
         order_type = mt5.ORDER_TYPE_BUY if signal.action == TradeAction.BUY else mt5.ORDER_TYPE_SELL
         price = tick.ask if signal.action == TradeAction.BUY else tick.bid
 
-        self.logger.info(f"⚡ Lanzando Gatillo Multi-Orden LoganGold: {signal.action.name} (Total: {total_lot} lotes a {price})")
+        self.logger.log(MILESTONE, f"⚡ Lanzando Gatillo Multi-Orden LoganGold: {signal.action.name} (Total: {total_lot} lotes a {price})")
 
         orders = [
             (vol_a, "Logan A 80%"),
@@ -198,6 +207,22 @@ class LoganGoldService(BaseService):
         return tp
 
     def _reconcile_signal_with_market(self, signal: TradeSignal, reference_price: float):
+        """
+        A veces el analista escribe TODO el bloque de precios (rango, SL, TPs)
+        con el mismo error sistemático en las centenas -- p.ej. "4493-4487"
+        cuando el precio real ronda 4393: sobran 100 puntos en TODOS los
+        números del mensaje, no solo en uno. _sanitize_tp corrige TPs sueltos
+        comparándolos contra el precio; esto es lo mismo pero a nivel de
+        bloque entero, usando como referencia un precio que SÍ sabemos que es
+        correcto: el precio real de apertura de las posiciones ya abiertas
+        por el "ya".
+
+        Deliberadamente NO se dispara por "el rango es ancho" (eso ya lo
+        probamos hace unos mensajes y daba falsos positivos con rangos anchos
+        legítimos), sino por "el precio real queda FUERA del rango declarado,
+        y no por poco". Si el precio real cae dentro del rango (por ancho que
+        sea), no se toca nada.
+        """
         if signal.entry_min <= 0.0 or signal.entry_max <= 0.0 or reference_price <= 0.0:
             return
 
@@ -250,9 +275,27 @@ class LoganGoldService(BaseService):
         current_price = tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask
 
         # -1. RECONCILIACIÓN DEL BLOQUE DE PRECIOS CONTRA EL PRECIO REAL
+        # Usa el precio real de apertura (dato mas fiable que tenemos) como
+        # referencia para detectar y corregir un error sistematico en TODO el
+        # mensaje, no solo en el SL. Va antes que el resto de escudos a
+        # proposito: si esto corrige el bloque, los escudos de abajo evaluan
+        # ya los numeros buenos.
         self._reconcile_signal_with_market(signal, active_positions[0].price_open)
 
         # 0. GUARDIÁN DE PLAUSIBILIDAD DEL SL
+        # Si las posiciones YA tenían un SL real puesto (esto no es la primera
+        # vez que llegan parámetros para esta señal -- esa primera vez siempre
+        # tiene sl=0 recién abiertas por el "ya"), y el SL que acaba de llegar
+        # se desvía una barbaridad del que ya tenían, no nos fiamos ciegamente:
+        # ni para sobreescribirlo ni, sobre todo, para dejar que el escudo
+        # anti-slippage de abajo cierre todo basándose en un número que puede
+        # ser un mensaje suelto, una errata o una edición mal clasificada como
+        # mensaje nuevo. Esto es justo lo que pasó hoy: llegó un "Nuevo
+        # mensaje" (no una edición) con SL=4308 cuando las posiciones ya
+        # tenían SL=4408 puesto -- una diferencia de 100 puntos totalmente
+        # implausible para un ajuste real, y bastó para que el precio actual
+        # (4394.77) "rebasara" ese SL falso y se cerrara todo sin que hubiera
+        # pasado nada realmente crítico en el mercado.
         existing_sls = {pos.sl for pos in active_positions if pos.sl and pos.sl > 0.0}
         if signal.stop_loss > 0.0 and existing_sls:
             max_deviation = max(abs(signal.stop_loss - sl) for sl in existing_sls)
@@ -301,7 +344,7 @@ class LoganGoldService(BaseService):
         sorted_positions = sorted(active_positions, key=lambda p: (-p.volume, p.ticket))
         targets = [tp_a, tp_b, tp_c]
         
-        self.logger.info(f"🔄 Inyectando SL exacto ({signal.stop_loss}) y TPs: 0.40={tp_a}, 0.05={tp_b}, 0.05={tp_c}")
+        self.logger.log(MILESTONE, f"🔄 Inyectando SL exacto ({signal.stop_loss}) y TPs: 0.40={tp_a}, 0.05={tp_b}, 0.05={tp_c}")
 
         for i, pos in enumerate(sorted_positions):
             target_tp = targets[i] if i < len(targets) else tp_a
@@ -322,6 +365,20 @@ class LoganGoldService(BaseService):
         limit_price = signal.entry_max - 1.0 if pos_type == mt5.POSITION_TYPE_SELL else signal.entry_min + 1.0
 
         # ESCUDO DE RE-ENTRADA INVERTIDA: un SELL_LIMIT solo es valido si el
+        # precio de la limit esta POR ENCIMA del precio actual (esperas una
+        # subida para vender mejor); un BUY_LIMIT solo si esta POR DEBAJO. Si
+        # el precio ya rebaso ese nivel en la direccion contraria (subio tanto
+        # que ya esta por encima de una SELL limit, o bajo tanto que ya esta
+        # por debajo de una BUY limit) antes de que diera tiempo a colocarla,
+        # MT5 la rechaza por invertida -- y como send_order() no comprueba el
+        # retcode, eso pasaba desapercibido: no saltaba SL (el escudo
+        # anti-slippage de _process_signal_parameters no se activa, porque el
+        # SL sigue intacto) pero tampoco existia ninguna orden real esperando
+        # si el precio volvia a bajar. En ese caso, en vez de la Limit,
+        # ejecutamos las 3 posiciones A/B/C A MERCADO ya mismo, con SL y TP
+        # puestos desde el principio (a diferencia del "ya" original, aqui SI
+        # tenemos ya esos datos), igual que si hubiera llegado una segunda
+        # señal "ya" para esta re-entrada.
         tick = self.executor.get_tick(symbol)
         current_price = (tick.bid if pos_type == mt5.POSITION_TYPE_SELL else tick.ask) if tick else None
 
@@ -384,7 +441,7 @@ class LoganGoldService(BaseService):
                 f"con SL={signal.stop_loss} y TP puestos desde ya."
             )
         else:
-            self.logger.info(f"⏳ Colocando {sum(1 for v, _, _ in orders if v > 0)} órdenes Limit estructurales en {limit_price}")
+            self.logger.log(MILESTONE, f"⏳ Colocando {sum(1 for v, _, _ in orders if v > 0)} órdenes Limit estructurales en {limit_price}")
         
         # 4. Lanzar las órdenes
         for vol, comment, tp in orders:
@@ -415,7 +472,7 @@ class LoganGoldService(BaseService):
             prefix = str_ref[:-len(str_raw)]
             final_sl = float(prefix + str(raw_sl))
 
-        self.logger.info(f"🛡️ Modificando SL de todas las posiciones a: {final_sl}")
+        self.logger.log(MILESTONE, f"🛡️ Modificando SL de todas las posiciones a: {final_sl}")
         for pos in positions:
             self.executor.modify_position_sl(pos.ticket, final_sl)
 
